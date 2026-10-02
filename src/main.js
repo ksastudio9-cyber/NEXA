@@ -1,10 +1,44 @@
 import './styles.css';
+import './offline.css';
+import './brand-refresh.css';
+import { cacheConversation, getCachedConversation, getOfflineActions, localModerationCheck, queueOfflineAction, removeOfflineAction } from './offline-store.js';
+import { USERNAME_PATTERN } from '../shared/validation.js';
 
 const ACCOUNT_DATA_VERSION = 'nexa-account-data-v2';
-if (localStorage.getItem(ACCOUNT_DATA_VERSION) !== 'ready') {
-  ['nexa-users', 'nexa-accounts', 'nexa-active-user', 'nexa-device-trusted', 'nexa-following'].forEach(key => localStorage.removeItem(key));
-  localStorage.setItem(ACCOUNT_DATA_VERSION, 'ready');
+function readLocalValue(key, fallback = null) {
+  try {
+    return localStorage.getItem(key) ?? fallback;
+  } catch {
+    return fallback;
+  }
 }
+
+function readLocalJson(key, fallback, isValid = () => true) {
+  try {
+    const value = JSON.parse(readLocalValue(key, 'null'));
+    return isValid(value) ? value : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function writeLocalValue(key, value) {
+  try {
+    localStorage.setItem(key, value);
+  } catch {}
+}
+
+function removeLocalValue(key) {
+  try {
+    localStorage.removeItem(key);
+  } catch {}
+}
+
+
+function isUserRecord(value) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+if (readLocalValue(ACCOUNT_DATA_VERSION) !== 'ready') writeLocalValue(ACCOUNT_DATA_VERSION, 'ready');
 
 const icons = {
   home: '⌂', feed: '◉', messages: '▱', channels: '◫', studio: '✦', communities: '♧',
@@ -13,8 +47,9 @@ const icons = {
 };
 
 if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.addEventListener('controllerchange', () => window.location.reload());
   window.addEventListener('load', () => {
-    navigator.serviceWorker.register('/sw.js').catch(() => {});
+    navigator.serviceWorker.register('/sw.js').then(registration => registration.update()).catch(() => {});
   });
 }
 
@@ -24,14 +59,15 @@ const state = {
   authLoading: false,
   authError: '',
   pendingUser: null,
-  users: JSON.parse(localStorage.getItem('nexa-users') || '[]').filter(user => user.email !== 'mohd@nexa.app' && user.username !== 'محمد السالم'),
-  accounts: JSON.parse(localStorage.getItem('nexa-accounts') || '[]').filter(user => user.email !== 'mohd@nexa.app' && user.username !== 'محمد السالم'),
-  activeUser: JSON.parse(localStorage.getItem('nexa-active-user') || 'null'),
-  deviceTrusted: localStorage.getItem('nexa-device-trusted') === 'true',
+  users: readLocalJson('nexa-users', [], Array.isArray).filter(user => isUserRecord(user) && user.email !== 'mohd@nexa.app' && user.username !== 'محمد السالم'),
+  accounts: readLocalJson('nexa-accounts', [], Array.isArray).filter(user => isUserRecord(user) && user.email !== 'mohd@nexa.app' && user.username !== 'محمد السالم'),
+  activeUser: readLocalJson('nexa-active-user', null, value => value === null || (typeof value === 'object' && !Array.isArray(value))),
+  deviceTrusted: readLocalValue('nexa-device-trusted') === 'true',
   active: 'feed',
+  feedFilter: 'for-you',
   liked: new Set(),
   saved: new Set(),
-  subscribed: new Set(JSON.parse(localStorage.getItem('nexa-following') || '[]')),
+  subscribed: new Set(readLocalJson('nexa-following', [], Array.isArray)),
   selectedChat: 0,
   selectedRecipientId: null,
   sentMessages: [],
@@ -47,30 +83,180 @@ const state = {
   unreadNotifications: 0,
   serverOwner: false,
   csrfToken: '',
-  toast: ''
+  toast: '',
+  offlineActions: [],
+  syncingOfflineActions: false,
+  online: navigator.onLine,
+  mediaRecorder: null,
+  cameraStream: null,
+  recordedChunks: [],
+  recordingTimeout: null
 };
 
 const apiOrigin = '';
 
 async function api(path, options = {}) {
-  const method = options.method || 'GET';
+  const { skipRefresh = false, ...requestOptions } = options;
+  const method = requestOptions.method || 'GET';
   if (method !== 'GET' && method !== 'HEAD' && !state.csrfToken) state.csrfToken = (await api('/api/csrf')).token;
-  const response = await fetch(`${apiOrigin}${path}`, { credentials: 'include', ...options, headers: { ...(options.body instanceof FormData ? {} : { 'Content-Type': 'application/json' }), ...(method !== 'GET' && method !== 'HEAD' ? { 'X-CSRF-Token': state.csrfToken } : {}), ...(options.headers || {}) } });
+  const response = await fetch(`${apiOrigin}${path}`, { credentials: 'include', ...requestOptions, headers: { ...(requestOptions.body instanceof FormData ? {} : { 'Content-Type': 'application/json' }), ...(method !== 'GET' && method !== 'HEAD' ? { 'X-CSRF-Token': state.csrfToken } : {}), ...(requestOptions.headers || {}) } });
   const payload = await response.json().catch(() => ({}));
+  if (response.status === 401 && !skipRefresh && !path.startsWith('/auth/')) {
+    try {
+      const refresh = await fetch(`${apiOrigin}/auth/refresh`, { method: 'POST', credentials: 'include' });
+      if (refresh.ok) return api(path, { ...requestOptions, skipRefresh: true });
+    } catch {
+      // Keep the original authentication failure for the caller.
+    }
+  }
   if (!response.ok && method === 'GET' && response.status === 401) return payload;
-  if (!response.ok) throw new Error(payload.error || 'API_REQUEST_FAILED');
+  if (!response.ok) {
+    const error = new Error(payload.error || 'API_REQUEST_FAILED');
+    error.status = response.status;
+    throw error;
+  }
   return payload;
+}
+
+function updateOfflineIndicator() {
+  let indicator = document.querySelector('#offline-indicator');
+  if (!indicator) {
+    indicator = document.createElement('div');
+    indicator.id = 'offline-indicator';
+    indicator.className = 'offline-indicator';
+    indicator.setAttribute('role', 'status');
+    document.body.append(indicator);
+  }
+  const pending = state.offlineActions.filter(action => action.status !== 'needs-review').length;
+  const needsReview = state.offlineActions.filter(action => action.status === 'needs-review').length;
+  indicator.hidden = state.online && pending === 0 && needsReview === 0;
+  indicator.textContent = !state.online
+    ? `أنت بلا اتصال. ${state.offlineActions.length} عنصر محفوظ على هذا الجهاز.`
+    : state.syncingOfflineActions
+      ? 'جارٍ مزامنة العناصر المحفوظة...'
+      : needsReview
+        ? `${needsReview} عنصر تعذرت مزامنته ويحتاج إلى مراجعة.`
+        : `${pending} عنصر بانتظار المزامنة.`;
+}
+
+async function refreshOfflineActions() {
+  try {
+    state.offlineActions = await getOfflineActions();
+  } catch {
+    state.offlineActions = [];
+    toast('التخزين دون اتصال غير متاح في هذا المتصفح');
+  }
+  updateOfflineIndicator();
+}
+
+async function enqueueAction(action) {
+  await queueOfflineAction({ ...action, status: 'queued', createdAt: action.createdAt || new Date().toISOString() });
+  await refreshOfflineActions();
+}
+
+function transientApiError(error) {
+  return !navigator.onLine || error instanceof TypeError || [429, 500, 502, 503, 504].includes(error.status);
+}
+
+function authErrorMessage(error) {
+  const messages = {
+    ACCOUNT_TEMPORARILY_LOCKED: 'تم إيقاف المحاولات مؤقتًا لحماية الحساب. حاول بعد 15 دقيقة.',
+    AUTH_REQUIRED: 'انتهت الجلسة. سجّل الدخول مجددًا ثم أكمل ملفك الشخصي.',
+    CSRF_INVALID: 'انتهت صلاحية الجلسة. حدّث الصفحة وحاول مجددًا.',
+    EMAIL_IN_USE: 'هذا البريد مسجل بالفعل. سجّل الدخول بدلًا من إنشاء حساب جديد.',
+    EMAIL_NOT_VERIFIED: 'تحقق من بريدك الإلكتروني أولًا.',
+    INVALID_CREDENTIALS: 'أدخل بريدًا صالحًا وكلمة مرور من 8 أحرف على الأقل.',
+    INVALID_PROFILE: 'تحقق من الاسم واليوزر. يجب أن يبدأ اليوزر بحرف إنجليزي ويكون طوله من 3 إلى 20 محرفًا.',
+    INVALID_LOGIN: 'البريد الإلكتروني أو كلمة المرور غير صحيحة.',
+    ORIGIN_NOT_ALLOWED: 'رابط الموقع غير معتمد للخادم. افتح أحدث رابط Codespaces للمنفذ 5173 أو حدّث APP_ORIGIN.',
+    RATE_LIMITED: 'محاولات كثيرة؛ انتظر قليلًا ثم أعد المحاولة.',
+    RATE_LIMIT_UNAVAILABLE: 'تعذر التحقق الأمني مؤقتًا. حاول بعد قليل.',
+    SMTP_NOT_CONFIGURED: 'التسجيل أو استعادة الحساب بالبريد غير مفعّل على الخادم. استخدم Google أو تواصل مع مسؤول التطبيق.',
+    SERVICES_UNAVAILABLE: 'خدمات التطبيق متوقفة مؤقتًا. أعد المحاولة بعد تشغيل الخادم وقاعدة البيانات.',
+    UPLOAD_CAPACITY_REACHED: 'الخادم مشغول الآن. أعد المحاولة بعد قليل.'
+  };
+  if (messages[error.message]) return messages[error.message];
+  if (error.status === 401) return 'البريد الإلكتروني أو كلمة المرور غير صحيحة.';
+  if (error.status === 403) return 'تعذر التحقق من الطلب. حدّث الصفحة وحاول مجددًا.';
+  if (error.status === 423) return messages.ACCOUNT_TEMPORARILY_LOCKED;
+  if (error.status === 429) return messages.RATE_LIMITED;
+  if (error.status >= 500 || error instanceof TypeError) return messages.SERVICES_UNAVAILABLE;
+  return 'تعذر إكمال الطلب. تحقق من البيانات وحاول مجددًا.';
+}
+
+async function syncOfflineActions() {
+  if (!navigator.onLine || state.syncingOfflineActions || !isAuthenticated()) return;
+  state.syncingOfflineActions = true;
+  updateOfflineIndicator();
+  try {
+    const actions = (await getOfflineActions()).sort((left, right) => left.createdAt.localeCompare(right.createdAt));
+    for (const action of actions) {
+      if (action.userId !== state.activeUser.id || action.status === 'needs-review') continue;
+      try {
+        if (action.type === 'message') {
+          const { message } = await api('/api/messages', {
+            method: 'POST',
+            body: JSON.stringify({ recipientId: action.recipientId, body: action.body, clientId: action.id })
+          });
+          if (state.selectedRecipientId === action.recipientId && !state.remoteMessages.some(item => item.id === message.id)) {
+            state.remoteMessages.push({ id: message.id, from: 'me', body: message.body, createdAt: message.createdAt });
+          }
+          const cached = await getCachedConversation(`${action.userId}:${action.recipientId}`).catch(() => null);
+          const messages = state.selectedRecipientId === action.recipientId
+            ? state.remoteMessages
+            : [...(cached?.messages || []), { id: message.id, from: 'me', body: message.body, createdAt: message.createdAt }];
+          await cacheConversation(`${action.userId}:${action.recipientId}`, messages);
+        } else if (action.type === 'video') {
+          const form = new FormData();
+          form.append('file', action.file, action.file.name);
+          form.append('uploadId', action.id);
+          const uploaded = await api('/api/media', { method: 'POST', body: form });
+          const { post } = await api('/api/posts', {
+            method: 'POST',
+            body: JSON.stringify({ body: action.caption, mediaUrl: uploaded.mediaUrl, moderationJobId: uploaded.moderationJobId, clientId: action.id })
+          });
+          state.remotePosts.unshift(apiPostToVideo(post));
+        }
+        await removeOfflineAction(action.id);
+      } catch (error) {
+        if (error.message === 'CONTENT_REJECTED') {
+          await queueOfflineAction({ ...action, status: 'needs-review', lastError: error.message });
+          continue;
+        }
+        if (error.message === 'AUTH_REQUIRED' || transientApiError(error)) break;
+        await queueOfflineAction({ ...action, status: 'needs-review', lastError: error.message });
+      }
+    }
+  } catch {
+    // Keep the outbox intact if storage or connectivity fails.
+  } finally {
+    state.syncingOfflineActions = false;
+    await refreshOfflineActions();
+    if (state.active === 'messages' || state.active === 'feed') render();
+  }
+}
+
+async function queueVideoForPublishing(file) {
+  if (!isAuthenticated()) throw new Error('AUTH_REQUIRED');
+  if (!document.querySelector('#media-moderation-consent')?.checked) throw new Error('MEDIA_CONSENT_REQUIRED');
+  const caption = 'فيديو جديد من استوديو NEXA';
+  if (localModerationCheck(caption)) throw new Error('CONTENT_REJECTED');
+  await enqueueAction({ id: crypto.randomUUID(), type: 'video', userId: state.activeUser.id, file, caption });
+  await syncOfflineActions();
+  state.active = 'feed';
+  render();
+  toast(navigator.onLine ? 'حُفظ الفيديو محليًا وبدأت مزامنته' : 'حُفظ الفيديو على الجهاز وسيرتفع عند عودة الاتصال');
 }
 
 function apiPostToVideo(post) {
   const author = post.author || {};
-  return { id: post.id, src: post.mediaUrl || '', author: author.displayName || author.username || 'NEXA', authorEmail: author.id, handle: `@${author.username || ''}`, avatar: (author.displayName || author.username || 'N').slice(0, 1).toUpperCase(), color: 'blue', title: post.body || 'منشور NEXA', tags: '#NEXA', views: post.likeCount || 0, liked: post.liked, saved: post.saved, postId: post.id };
+  return { id: post.id, src: post.mediaUrl || '', author: author.displayName || author.username || 'NEXA', authorEmail: author.id, handle: `@${author.username || ''}`, avatar: (author.displayName || author.username || 'N').slice(0, 1).toUpperCase(), color: 'green', title: post.body || 'منشور NEXA', tags: '#NEXA', views: post.likeCount || 0, liked: post.liked, saved: post.saved, postId: post.id, createdAt: post.createdAt };
 }
 
 state.devUnlocked = false;
-state.devFingerprint = localStorage.getItem('nexa-dev-fingerprint') || (crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random()}`);
+state.devFingerprint = readLocalValue('nexa-dev-fingerprint') || (crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random()}`);
 state.devOwner = false;
-localStorage.setItem('nexa-dev-fingerprint', state.devFingerprint);
+writeLocalValue('nexa-dev-fingerprint', state.devFingerprint);
 state.logoPresses = 0;
 state.logoPressTimer = null;
 
@@ -162,12 +348,14 @@ async function hydrateBackendSession() {
     if (existingIndex >= 0) state.users[existingIndex] = { ...state.users[existingIndex], ...user };
     else state.users.push(user);
     state.activeUser = state.users[existingIndex >= 0 ? existingIndex : state.users.length - 1];
+    state.pendingUser = needsProfileSetup ? state.activeUser : null;
     state.accounts = [...new Map([...state.accounts, state.activeUser].map(item => [item.email, item])).values()];
     state.deviceTrusted = true;
-    state.authScreen = 'guest';
+    state.authScreen = needsProfileSetup ? 'forced-profile' : 'guest';
     state.active = 'feed';
     persistAuth();
     render();
+    syncOfflineActions();
   } catch {
     state.activeUser = null;
     state.deviceTrusted = false;
@@ -207,18 +395,34 @@ async function hydrateBackendMessages() {
     return;
   }
 
-  const contacts = discoverableUsers().slice(0, 8);
-  state.conversationUsers = contacts.map(user => ({
-    id: user.id,
-    userId: user.id,
-    name: user.displayName || user.username,
-    avatar: user.avatar || (user.displayName || user.username || 'N').slice(0, 1).toUpperCase(),
-    color: user.color || 'blue',
-    preview: 'رسالة جديدة',
-    time: 'الآن',
-    online: true,
-    email: user.email
-  }));
+  let contacts;
+  try {
+    const { users = [] } = await api('/api/users');
+    contacts = users.map(user => ({
+      id: user.id,
+      userId: user.id,
+      name: user.displayName || user.username,
+      avatar: (user.displayName || user.username || 'N').slice(0, 1).toUpperCase(),
+      color: 'blue',
+      preview: 'ابدأ محادثة',
+      time: '',
+      online: false
+    }));
+    await cacheConversation(`contacts:${state.activeUser.id}`, contacts);
+  } catch {
+    const cached = await getCachedConversation(`contacts:${state.activeUser.id}`).catch(() => null);
+    contacts = cached?.messages || discoverableUsers().slice(0, 8).map(user => ({
+      id: user.id,
+      userId: user.id,
+      name: user.displayName || user.username,
+      avatar: user.avatar || (user.displayName || user.username || 'N').slice(0, 1).toUpperCase(),
+      color: user.color || 'blue',
+      preview: 'ابدأ محادثة',
+      time: '',
+      online: false
+    }));
+  }
+  state.conversationUsers = contacts;
 
   if (!state.conversationUsers.length) {
     state.remoteMessages = [];
@@ -228,6 +432,7 @@ async function hydrateBackendMessages() {
 
   const recipientId = state.selectedRecipientId || state.conversationUsers[0].userId;
   state.selectedRecipientId = recipientId;
+  const cacheId = `${state.activeUser.id}:${recipientId}`;
 
   try {
     const { messages = [] } = await api(`/api/messages?recipientId=${encodeURIComponent(recipientId)}`);
@@ -237,11 +442,13 @@ async function hydrateBackendMessages() {
       body: message.body,
       createdAt: message.createdAt
     }));
+    await cacheConversation(cacheId, state.remoteMessages);
     if (!state.remoteMessages.length) {
       state.remoteMessages = [{ id: `seed-${recipientId}`, from: 'other', body: 'ابدأ المحادثة وأرسل أول رسالة.', createdAt: new Date().toISOString() }];
     }
   } catch {
-    state.remoteMessages = [{ id: `offline-${recipientId}`, from: 'other', body: 'لا توجد رسائل متاحة الآن.', createdAt: new Date().toISOString() }];
+    const cached = await getCachedConversation(cacheId).catch(() => null);
+    state.remoteMessages = cached?.messages || [];
   }
 }
 
@@ -249,9 +456,9 @@ function isAuthenticated() { return Boolean(state.activeUser && state.deviceTrus
 function isBoss() { return isAuthenticated() && normalizeRole(state.activeUser.role) === 'owner'; }
 function claimDeveloperBoss() {
   if (state.devUnlocked && state.devOwner) return true;
-  const owner = localStorage.getItem('nexa-dev-boss-email');
+  const owner = readLocalValue('nexa-dev-boss-email');
   if (!owner && isAuthenticated()) {
-    localStorage.setItem('nexa-dev-boss-email', state.activeUser.email);
+    writeLocalValue('nexa-dev-boss-email', state.activeUser.email);
     state.activeUser.role = 'owner';
     state.activeUser.developerStatus = 'approved';
     const user = state.users.find(item => item.email === state.activeUser.email);
@@ -277,13 +484,13 @@ function verificationBadge(user = currentUser()) {
   return '';
 }
 
-async function saveProfileForm(form, firstSetup) {
+async function saveProfileForm(form) {
   const values = new FormData(form);
   const displayName = String(values.get('displayName') || '').trim();
   const username = String(values.get('username') || '').trim();
   const usernameTaken = state.users.some(user => user.username.toLowerCase() === username.toLowerCase() && user.email !== (state.pendingUser?.email || currentUser().email));
-  if (!/^[A-Za-z0-9_]+$/.test(username) || usernameTaken) {
-    state.authError = usernameTaken ? 'اسم المستخدم مستخدم بالفعل.' : 'استخدم حروفاً إنجليزية وأرقاماً و _ فقط.';
+  if (!USERNAME_PATTERN.test(username) || usernameTaken) {
+    state.authError = usernameTaken ? 'اسم المستخدم مستخدم بالفعل.' : 'يبدأ اليوزر بحرف إنجليزي، ويتكون من 3 إلى 20 حرفًا أو رقمًا أو _.';
     render();
     return;
   }
@@ -294,7 +501,7 @@ async function saveProfileForm(form, firstSetup) {
       const result = await api('/api/me', { method: 'PATCH', body: JSON.stringify({ displayName, username }) });
       Object.assign(target, { ...result.user, avatar: displayName.slice(0, 1).toUpperCase(), profileSetup: true });
     } catch (error) {
-      state.authError = error.message === 'USERNAME_IN_USE' ? 'اسم المستخدم مستخدم بالفعل.' : moderationMessage(error) || 'تعذر حفظ الملف الشخصي.';
+      state.authError = error.message === 'USERNAME_IN_USE' ? 'اسم المستخدم مستخدم بالفعل، اختر يوزرًا آخر.' : moderationMessage(error) || authErrorMessage(error);
       render();
       return;
     }
@@ -302,21 +509,18 @@ async function saveProfileForm(form, firstSetup) {
   Object.assign(target, { displayName, username, bio: String(values.get('bio') || '').trim(), avatar: displayName.slice(0, 1).toUpperCase(), profileSetup: true });
   const index = state.users.findIndex(user => user.email === target.email);
   if (index >= 0) state.users[index] = target;
-  state.pendingUser = target;
+  state.pendingUser = null;
   state.authError = '';
-  persistAuth();
-  if (firstSetup) {
-    state.authScreen = 'device';
-    if (window.history.pushState) window.history.replaceState({}, '', '/home');
-  } else {
-    state.activeUser = target;
-    state.active = 'profile';
-  }
   state.activeUser = target;
   state.activeUser.profileSetup = true;
+  state.deviceTrusted = true;
+  state.active = 'feed';
   state.authScreen = 'guest';
+  persistAuth();
   if (window.history.pushState) window.history.replaceState({}, '', '/home');
   render();
+  hydrateBackendContent();
+  syncOfflineActions();
 }
 
 function discoverableUsers() {
@@ -351,11 +555,11 @@ function authShell(content) { return `<div class="auth-shell"><div class="auth-a
 
 function authError() { return state.authError ? `<div class="auth-error">${icons.shield} ${state.authError}</div>` : ''; }
 
-function loginView() { return authShell(`<div class="auth-heading"><span class="eyebrow">${state.authPrompt || 'مرحباً بعودتك'}</span><h2>ادخل إلى عالمك</h2><p>تابع من حيث توقفت، كل شيء بانتظارك.</p></div>${authError()}<form class="auth-form" data-auth="login"><label>البريد الإلكتروني<input name="email" type="email" placeholder="you@example.com" required /></label><label>كلمة المرور<div class="password-field"><input name="password" type="password" placeholder="أدخل كلمة المرور" required minlength="6" /><button type="button" data-toggle-password>إظهار</button></div></label><div class="auth-options"><label class="check-label"><input type="checkbox" checked /> تذكرني</label><button type="button" class="link-btn">نسيت كلمة المرور؟</button></div><button class="auth-submit" type="submit">${state.authLoading ? 'جارٍ التحقق...' : 'تسجيل الدخول'} <span>←</span></button></form><div class="auth-divider"><span>أو</span></div><button class="social-login google-login" type="button" data-local-google>الدخول باستخدام Google <span>G</span></button><button class="social-login" type="button" data-auth-screen="register">ابدأ بإنشاء حسابك <span>✦</span></button><p class="auth-switch">ليس لديك حساب؟ <button data-auth-screen="register">إنشاء حساب جديد</button></p>`); }
+function loginView() { return authShell(`<div class="auth-heading"><span class="eyebrow">${state.authPrompt || 'مرحباً بعودتك'}</span><h2>ادخل إلى عالمك</h2><p>تابع من حيث توقفت، كل شيء بانتظارك.</p></div>${authError()}<form class="auth-form" data-auth="login"><label>البريد الإلكتروني<input name="email" type="email" placeholder="you@example.com" autocomplete="email" required /></label><label>كلمة المرور<div class="password-field"><input name="password" type="password" placeholder="أدخل كلمة المرور" autocomplete="current-password" required minlength="8" /><button type="button" data-toggle-password>إظهار</button></div></label><div class="auth-options"><label class="check-label"><input type="checkbox" checked /> تذكرني</label><button type="button" class="link-btn" data-request-reset>نسيت كلمة المرور؟</button></div><button class="auth-submit" type="submit">${state.authLoading ? 'جارٍ التحقق...' : 'تسجيل الدخول'} <span>←</span></button></form><div class="auth-divider"><span>أو</span></div><button class="social-login google-login" type="button" data-local-google>الدخول باستخدام Google <span>G</span></button><button class="social-login" type="button" data-auth-screen="register">ابدأ بإنشاء حسابك <span>✦</span></button><p class="auth-switch">ليس لديك حساب؟ <button data-auth-screen="register">إنشاء حساب جديد</button></p>`); }
 
-function registerView() { return authShell(`<div class="auth-heading"><span class="eyebrow">انضم إلى NEXA</span><h2>أنشئ حسابك</h2><p>سننشئ لك هوية مؤقتة، ثم تختار اسمك بنفسك في الخطوة التالية.</p></div>${authError()}<form class="auth-form" data-auth="register"><label>البريد الإلكتروني<input name="email" type="email" placeholder="you@example.com" required /></label><label>كلمة المرور<div class="password-field"><input name="password" type="password" placeholder="6 أحرف على الأقل" required minlength="6" /><button type="button" data-toggle-password>إظهار</button></div></label><button class="auth-submit" type="submit">${state.authLoading ? 'جارٍ إنشاء الحساب...' : 'إنشاء الحساب'} <span>←</span></button></form><p class="auth-switch">لديك حساب بالفعل؟ <button data-auth-screen="login">تسجيل الدخول</button></p>`); }
+function registerView() { return authShell(`<div class="auth-heading"><span class="eyebrow">انضم إلى NEXA</span><h2>أنشئ حسابك</h2><p>بعد تأكيد بريدك الإلكتروني، أكمل إعداد ملفك الشخصي.</p></div>${authError()}<form class="auth-form" data-auth="register"><label>البريد الإلكتروني<input name="email" type="email" placeholder="you@example.com" autocomplete="email" required /></label><label>كلمة المرور<div class="password-field"><input name="password" type="password" placeholder="8 أحرف على الأقل" autocomplete="new-password" required minlength="8" /><button type="button" data-toggle-password>إظهار</button></div></label><button class="auth-submit" type="submit">${state.authLoading ? 'جارٍ إنشاء الحساب...' : 'إنشاء الحساب'} <span>←</span></button></form><p class="auth-switch">لديك حساب بالفعل؟ <button data-auth-screen="login">تسجيل الدخول</button></p>`); }
 
-function forcedNameView() { const user = state.pendingUser; return authShell(`<div class="auth-heading"><span class="eyebrow">خطوة إلزامية</span><h2>اختر هويتك في NEXA</h2><p>هذه الهوية العشوائية مؤقتة. عدّل الاسم واليوزر قبل دخول التطبيق.</p></div>${authError()}<form class="auth-form" data-profile-setup><label>الاسم المعروض<input name="displayName" value="${user.displayName || ''}" required minlength="2" maxlength="30" /></label><label>اسم المستخدم<input name="username" value="${user.username || ''}" pattern="[A-Za-z0-9_]+" required minlength="3" maxlength="20" /><small class="field-hint">حروف إنجليزية وأرقام و _ فقط</small></label><button class="auth-submit" type="submit">${state.authLoading ? 'جارٍ الحفظ...' : 'حفظ والدخول'} <span>←</span></button></form>`); }
+function forcedNameView() { const user = state.pendingUser || state.activeUser || { displayName: '', username: '' }; return authShell(`<div class="auth-heading"><span class="eyebrow">إكمال الحساب</span><h2>اختر اسمك في NEXA</h2><p>اكتب الاسم الظاهر واليوزر الذي سيستخدمه الآخرون للعثور عليك.</p></div>${authError()}<form class="auth-form" data-profile-setup><label>الاسم المعروض<input name="displayName" value="${user.displayName || ''}" required minlength="2" maxlength="30" autocomplete="name" /></label><label>اسم المستخدم<input name="username" value="${user.username || ''}" pattern="${USERNAME_PATTERN.source}" placeholder="nexa_user" required minlength="3" maxlength="20" autocomplete="username" /><small class="field-hint">يبدأ بحرف إنجليزي، ثم أحرف أو أرقام أو _ (من 3 إلى 20 محرفًا)</small></label><button class="auth-submit" type="submit">${state.authLoading ? 'جارٍ الحفظ...' : 'حفظ والدخول'} <span>←</span></button></form>`); }
 
 function deviceBindView() { const user = state.pendingUser || currentUser(); return authShell(`<div class="device-icon">${icons.shield}</div><div class="auth-heading centered"><span class="eyebrow">خطوة أمان أخيرة</span><h2>اربط جهازك</h2><p>نحتاج لتوثيق هذا الجهاز حتى يبقى حسابك آمناً.</p></div><div class="device-card"><div class="device-symbol">⌁</div><div><strong>جهاز Linux الحالي</strong><small>تم اكتشافه الآن · موقع تقريبي محلي</small></div><span class="device-check">✓</span></div>${authError()}<button class="auth-submit" data-bind-device>${state.authLoading ? 'جارٍ التحقق...' : 'توثيق هذا الجهاز'} <span>←</span></button><button class="ghost-btn" data-auth-screen="login">إلغاء والعودة</button><small class="device-note">لن نطلب هذا التحقق مجدداً على هذا الجهاز الموثوق.</small>`); }
 
@@ -366,7 +570,12 @@ function shell(content, title, eyebrow = '') {
 }
 
 function feedView() {
-  const streamVideos = [...state.userVideos, ...state.remotePosts, ...videos];
+  const allStreamVideos = [...state.userVideos, ...state.remotePosts, ...videos];
+  const streamVideos = state.feedFilter === 'following'
+    ? allStreamVideos.filter(video => state.subscribed.has(video.authorEmail))
+    : state.feedFilter === 'latest'
+      ? [...allStreamVideos].sort((left, right) => new Date(right.createdAt || 0) - new Date(left.createdAt || 0))
+      : allStreamVideos;
   const people = discoverableUsers();
   const streamContent = streamVideos.length ? streamVideos.map(videoCard).join('') : `<div class="stream-empty"><span>${icons.studio}</span><h2>لا توجد فيديوهات بعد</h2><p>أنشئ فيديوك الأول ليظهر هنا للمستخدمين.</p><button class="primary-btn" data-nav="studio">افتح الاستوديو <span>←</span></button></div>`;
   return shell(`<div class="feed-layout"><section class="feed-column"><div class="stories-row"><button class="story add-story" data-nav="studio"><span>${icons.plus}</span><small>قصتك</small></button>${['قصتك'].map(x => `<button class="story" data-nav="studio"><span class="story-ring coral">${currentUser().avatar}</span><small>${x}</small></button>`).join('')}</div><div class="feed-tabs"><button class="selected">لك</button><button>يتابعون</button><button>الأحدث</button><span class="feed-filter">⌁</span></div><div class="stream-label"><span class="eyebrow">NEXA STREAM</span><small>${streamVideos.length ? 'اسحب للأعلى للمقطع التالي' : 'ابدأ بالنشر'}</small></div><div class="stream-list">${streamContent}</div></section><aside class="feed-side"><div class="ai-card"><div class="ai-heading"><span class="ai-orb">✦</span><div><small>HyperBrain</small><strong>توصياتك تبدأ منك</strong></div></div><p>ستتغير التوصيات بعد مشاهدة فيديوهات المستخدمين والتفاعل معها.</p><button class="text-btn">إدارة التفضيلات <span>←</span></button></div><div class="suggestions"><div class="section-heading"><h3>أشخاص على NEXA</h3><button>تحديث</button></div>${people.length ? people.map(user => `<div class="suggestion">${avatar(user.avatar, user.color)}<div><strong>${user.username} ${verificationBadge(user)}</strong><small>${user.followers || 0} متابع</small></div><button class="follow-btn ${state.subscribed.has(user.email) ? 'following' : ''}" data-follow-person="${user.email}">${state.subscribed.has(user.email) ? 'تتابعه' : 'متابعة'}</button></div>`).join('') : '<p class="suggestions-empty">لا يوجد أشخاص آخرون بعد.</p>'}</div></aside></div>`, 'مساحتك اليوم', 'الثلاثاء، 22 سبتمبر 2026');
@@ -387,7 +596,10 @@ function messagesView() {
   const chat = state.conversationUsers.find(item => item.userId === state.selectedRecipientId) || state.conversationUsers[0];
   if (!chat) return shell(`<div class="messages-empty"><span>${icons.messages}</span><h2>لا توجد محادثات بعد</h2><p>ستظهر محادثاتك هنا عندما تتواصل مع مستخدمين حقيقيين.</p><button class="primary-btn" data-nav="feed">استكشف الفيديوهات <span>←</span></button></div>`, 'محادثاتك', 'التواصل');
 
-  const messageList = state.remoteMessages.length ? state.remoteMessages.map(message => `<div class="message ${message.from === 'me' ? 'sent' : 'received'}">${escapeHtml(message.body)}<small>${new Date(message.createdAt).toLocaleTimeString('ar-EG', { hour: '2-digit', minute: '2-digit' })}</small></div>`).join('') : '<div class="message received">ابدأ المحادثة أول رسالة لك.<small>الآن</small></div>';
+  const remoteMessageIds = new Set(state.remoteMessages.map(message => message.id));
+  const queuedMessages = state.offlineActions.filter(action => action.type === 'message' && action.userId === state.activeUser?.id && action.recipientId === chat.userId && !remoteMessageIds.has(action.id)).map(action => ({ id: action.id, from: 'me', body: action.body, createdAt: action.createdAt, queued: true, needsReview: action.status === 'needs-review' }));
+  const messages = [...state.remoteMessages, ...queuedMessages].sort((left, right) => left.createdAt.localeCompare(right.createdAt));
+  const messageList = messages.length ? messages.map(message => `<div class="message ${message.from === 'me' ? 'sent' : 'received'} ${message.queued ? 'queued' : ''}">${escapeHtml(message.body)}<small>${message.needsReview ? 'تحتاج مراجعة' : message.queued ? 'محفوظة على الجهاز · بانتظار الإرسال' : new Date(message.createdAt).toLocaleTimeString('ar-EG', { hour: '2-digit', minute: '2-digit' })}</small>${message.queued ? `<button class="offline-remove" data-remove-offline="${escapeHtml(message.id)}" aria-label="حذف الرسالة المحفوظة">حذف</button>` : ''}</div>`).join('') : '<div class="message received">ابدأ المحادثة وأرسل أول رسالة.</div>';
 
   return shell(`<div class="messages-layout"><section class="chat-list"><div class="list-header"><div><h2>الرسائل</h2><small>تواصل مع دائرتك</small></div><button class="round-add">${icons.plus}</button></div><div class="message-search">${icons.search}<input placeholder="البحث في المحادثات" /></div><div class="chat-tabs"><button class="selected">الكل</button><button>غير مقروءة</button><button>مجموعات</button></div>${state.conversationUsers.map((c, i) => `<button class="chat-row ${c.userId === state.selectedRecipientId ? 'selected' : ''}" data-chat="${c.userId}">${avatar(c.avatar, c.color)}<div class="chat-info"><strong>${c.name}</strong><small>${c.preview}</small></div><div class="chat-meta"><small>${c.time}</small></div></button>`).join('')}</section><section class="chat-window"><header class="chat-header">${avatar(chat.avatar, chat.color)}<div><strong>${chat.name}</strong><small>${chat.online ? 'متصل الآن' : 'آخر ظهور اليوم'}</small></div><div class="chat-tools"><button>${icons.search}</button><button>${icons.more}</button></div></header><div class="chat-messages">${messageList}</div><form class="composer"><button type="button" class="attach-btn">${icons.plus}</button><input id="message-input" placeholder="اكتب رسالة..." autocomplete="off" /><button type="button" class="emoji-btn">☺</button><button class="send-btn" aria-label="إرسال">${icons.send}</button></form></section></div>`, 'محادثاتك', 'التواصل');
 }
@@ -406,7 +618,7 @@ function moderationView() {
   }).join('');
   return shell(`<div class="explore-page"><div class="section-heading"><div><span class="eyebrow">إشراف المجتمع</span><h2>مراجعة المحتوى</h2><small>${state.moderationPosts.length} منشور بانتظار المراجعة</small></div><button class="outline-btn" data-refresh-moderation>تحديث</button></div><div class="explore-posts">${items || '<div class="explore-empty">لا يوجد محتوى بانتظار المراجعة.</div>'}</div></div>`, 'مراجعة المحتوى', 'الإشراف');
 }
-function profileEditView() { const user = currentUser(); return shell(`<div class="profile-edit-page"><div class="page-heading"><div><span class="eyebrow">ملفك الشخصي</span><h2>عدّل هويتك</h2><p>غيّر الاسم واليوزر والنبذة في أي وقت.</p></div></div><form class="profile-form" data-profile-edit-form><label>الاسم المعروض<input name="displayName" value="${user.displayName || ''}" required minlength="2" maxlength="30" /></label><label>اسم المستخدم<input name="username" value="${user.username || ''}" pattern="[A-Za-z0-9_]+" required minlength="3" maxlength="20" /><small class="field-hint">حروف إنجليزية وأرقام و _ فقط</small></label><label>النبذة<textarea name="bio" maxlength="120" placeholder="اكتب نبذة قصيرة">${user.bio || ''}</textarea></label><button class="auth-submit" type="submit">حفظ التغييرات <span>←</span></button></form></div>`, 'الملف الشخصي', 'حسابك'); }
+function profileEditView() { const user = currentUser(); return shell(`<div class="profile-edit-page"><div class="page-heading"><div><span class="eyebrow">ملفك الشخصي</span><h2>عدّل هويتك</h2><p>غيّر الاسم واليوزر والنبذة في أي وقت.</p></div></div><form class="profile-form" data-profile-edit-form><label>الاسم المعروض<input name="displayName" value="${user.displayName || ''}" required minlength="2" maxlength="30" /></label><label>اسم المستخدم<input name="username" value="${user.username || ''}" pattern="${USERNAME_PATTERN.source}" required minlength="3" maxlength="20" /><small class="field-hint">يبدأ بحرف إنجليزي، ثم أحرف أو أرقام أو _</small></label><label>النبذة<textarea name="bio" maxlength="120" placeholder="اكتب نبذة قصيرة">${user.bio || ''}</textarea></label><button class="auth-submit" type="submit">حفظ التغييرات <span>←</span></button></form></div>`, 'الملف الشخصي', 'حسابك'); }
 
 function profileView() {
   const user = currentUser();
@@ -428,6 +640,9 @@ function developerAppView() {
 }
 
 function render() {
+  const root = document.querySelector('#app');
+  if (!root) return;
+  try {
   const route = (window.location.pathname || '/').replace(/\/+$/, '') || '/';
   if (route === '/dev' && state.serverOwner) {
     document.querySelector('#app').innerHTML = developerView();
@@ -458,6 +673,11 @@ function render() {
   }
   const views = { feed: feedView, explore: exploreView, messages: messagesView, studio: studioView, spaces: spacesView, profile: profileView, 'profile-edit': profileEditView, developers: developerAppView, moderation: moderationView };
   document.querySelector('#app').innerHTML = views[state.active](); bindEvents();
+  } catch (error) {
+    console.error('NEXA render failed', error);
+    root.innerHTML = `<main dir="rtl" style="min-height:100vh;display:grid;place-items:center;padding:24px;background:#071009;color:#f3fff4;font-family:system-ui,sans-serif;text-align:center"><section style="max-width:420px"><img src="/icon.svg" alt="NEXA" width="64" height="64" style="border-radius:16px"><h1>تعذر عرض الصفحة</h1><p>حدث خطأ أثناء تحميل الواجهة. بياناتك لم تُحذف؛ أعد تحميل الموقع للمحاولة مجددًا.</p><button id="reload-app" style="padding:12px 20px;border:0;border-radius:8px;background:#a8ff35;color:#071009;font-weight:700;cursor:pointer">إعادة تحميل الموقع</button></section></main>`;
+    root.querySelector('#reload-app')?.addEventListener('click', () => window.location.reload());
+  }
 }
 function toast(message) { state.toast = message; const el = document.createElement('div'); el.className = 'toast'; el.textContent = message; document.body.appendChild(el); setTimeout(() => el.remove(), 2200); }
 function moderationMessage(error) { return error?.message === 'CONTENT_REJECTED' ? 'تم رفض المحتوى لمخالفته إرشادات NEXA.' : null; }
@@ -480,6 +700,19 @@ function setupVideoAutoplay() {
   if (videosOnPage[0]) startVideo(videosOnPage[0]);
 }
 function bindEvents() {
+  const feedFilters = ['for-you', 'following', 'latest'];
+  document.querySelectorAll('.feed-tabs button').forEach((button, index) => {
+    button.classList.toggle('selected', feedFilters[index] === state.feedFilter);
+    button.addEventListener('click', () => {
+      state.feedFilter = feedFilters[index];
+      render();
+    });
+  });
+  document.querySelectorAll('[data-remove-offline]').forEach(button => button.addEventListener('click', async () => {
+    await removeOfflineAction(button.dataset.removeOffline);
+    await refreshOfflineActions();
+    render();
+  }));
   document.querySelectorAll('[data-refresh-moderation]').forEach(button => button.addEventListener('click', async () => {
     try {
       state.moderationPosts = (await api('/api/moderation/posts')).posts || [];
@@ -546,25 +779,70 @@ function bindEvents() {
   document.querySelectorAll('[data-dev-action]').forEach(button => button.addEventListener('click', () => { toast('أرسل طلبك إلى البوس من بوابة API الخاصة بالمطورين.'); }));
   document.querySelectorAll('[data-dev-login]').forEach(button => button.addEventListener('click', () => { state.authScreen = 'login'; state.authPrompt = 'سجّل الدخول للمطالبة ببوابة المطورين'; window.history.replaceState({}, '', '/'); render(); }));
   const studioPanel = document.querySelector('.studio-panel');
+  const studioNotice = document.querySelector('.studio-note p');
+  if (studioNotice) studioNotice.innerHTML = '<strong>فحص محلي أساسي</strong><br />قواعد كلمات تعمل دون اتصال، وليست نموذج ذكاء اصطناعي.';
   if (studioPanel && !document.querySelector('#video-upload')) {
     studioPanel.insertAdjacentHTML('beforeend', '<div class="upload-control"><input id="video-upload" type="file" accept="video/*" hidden /><button type="button" data-upload-video disabled>رفع فيديو من جهازك <span>↑</span></button><label class="media-consent"><input id="media-moderation-consent" type="checkbox" /> أوافق على فحص الفيديو آليًا؛ عند تفعيل التكامل يُرسل إلى AWS، وتظل الوسائط مخفية حتى اجتياز الفحص أو مراجعة المشرف.</label><small>تتطلب الملفات غير المدعومة أو نتيجة الفحص المشكوك فيها مراجعة بشرية.</small></div>');
   }
+  const moderationDisclaimer = document.createElement('small');
+  moderationDisclaimer.className = 'local-moderation-note';
+  moderationDisclaimer.textContent = 'الفحص المحلي يراجع النص فقط، ولا يحلل صورة الفيديو أو صوته. المراجعة السحابية تحتاج اتصالًا.';
+  document.querySelector('.upload-control')?.append(moderationDisclaimer);
   const mediaConsent = document.querySelector('#media-moderation-consent');
   const uploadButton = document.querySelector('[data-upload-video]');
   if (mediaConsent && uploadButton) mediaConsent.addEventListener('change', () => { uploadButton.disabled = !mediaConsent.checked; });
   document.querySelectorAll('[data-upload-video]').forEach(button => button.addEventListener('click', () => document.querySelector('#video-upload')?.click()));
+  const captureButton = document.querySelector('.capture');
+  if (captureButton) captureButton.addEventListener('click', async () => {
+    if (state.mediaRecorder?.state === 'recording') {
+      state.mediaRecorder.stop();
+      return;
+    }
+    if (!mediaConsent?.checked) { toast('وافق على فحص الفيديو قبل بدء التصوير'); return; }
+    if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) { toast('التصوير غير مدعوم في هذا المتصفح؛ استخدم رفع فيديو'); return; }
+    try {
+      state.cameraStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: { facingMode: 'user' } });
+      const preview = document.createElement('video');
+      preview.className = 'camera-preview';
+      preview.autoplay = true;
+      preview.muted = true;
+      preview.playsInline = true;
+      preview.srcObject = state.cameraStream;
+      document.querySelector('.camera-frame')?.prepend(preview);
+      const supportedType = ['video/webm;codecs=vp8,opus', 'video/webm'].find(type => MediaRecorder.isTypeSupported(type));
+      state.mediaRecorder = new MediaRecorder(state.cameraStream, supportedType ? { mimeType: supportedType } : {});
+      state.recordedChunks = [];
+      state.mediaRecorder.addEventListener('dataavailable', event => { if (event.data.size) state.recordedChunks.push(event.data); });
+      state.mediaRecorder.addEventListener('stop', () => {
+        clearTimeout(state.recordingTimeout);
+        const videoType = (state.mediaRecorder?.mimeType || 'video/webm').split(';')[0];
+        const blob = new Blob(state.recordedChunks, { type: videoType });
+        const extension = videoType === 'video/mp4' ? 'mp4' : 'webm';
+        const file = new File([blob], `nexa-${Date.now()}.${extension}`, { type: videoType });
+        state.cameraStream?.getTracks().forEach(track => track.stop());
+        state.cameraStream = null;
+        state.mediaRecorder = null;
+        state.recordedChunks = [];
+        preview.remove();
+        captureButton.classList.remove('recording');
+        if (file.size) queueVideoForPublishing(file).catch(error => toast(error.message === 'AUTH_REQUIRED' ? 'سجّل الدخول أولًا' : 'تعذر حفظ التسجيل'));
+      }, { once: true });
+      state.mediaRecorder.start(1000);
+      captureButton.classList.add('recording');
+      state.recordingTimeout = setTimeout(() => state.mediaRecorder?.stop(), 60000);
+    } catch {
+      state.cameraStream?.getTracks().forEach(track => track.stop());
+      state.cameraStream = null;
+      toast('تعذر الوصول إلى الكاميرا أو الميكروفون');
+    }
+  });
+  document.querySelectorAll('.camera-top button').forEach(button => button.addEventListener('click', () => {
+    if (state.mediaRecorder?.state === 'recording') state.mediaRecorder.stop();
+  }));
   document.querySelectorAll('#video-upload').forEach(input => input.addEventListener('change', event => {
     const file = event.target.files?.[0];
     if (!file || !file.type.startsWith('video/')) return;
-    if (!document.querySelector('#media-moderation-consent')?.checked) { toast('وافق على فحص الوسائط قبل الرفع'); return; }
-    const form = new FormData();
-    form.append('file', file);
-    api('/api/media', { method: 'POST', body: form }).then(async ({ mediaUrl, moderationJobId, scanMode }) => ({ ...(await api('/api/posts', { method: 'POST', body: JSON.stringify({ body: 'فيديو جديد من استوديو NEXA', mediaUrl, moderationJobId }) })), scanMode })).then(({ post, scanMode }) => {
-      state.remotePosts.unshift(apiPostToVideo(post));
-      state.active = 'feed';
-      render();
-      toast(scanMode === 'automatic' ? 'تم رفع الفيديو، وينتظر اكتمال فحص السلامة' : 'تم رفع الفيديو، وينتظر مراجعة المشرف قبل ظهوره للآخرين');
-    }).catch(error => toast(error.message === 'AUTH_REQUIRED' ? 'سجّل الدخول أولًا' : moderationMessage(error) || 'تعذر رفع الفيديو'));
+    queueVideoForPublishing(file).catch(error => toast(error.message === 'AUTH_REQUIRED' ? 'سجّل الدخول أولًا' : error.message === 'MEDIA_CONSENT_REQUIRED' ? 'وافق على فحص الوسائط قبل الرفع' : 'تعذر حفظ الفيديو على هذا الجهاز'));
   }));
   document.querySelectorAll('[data-auth-screen]').forEach(el => el.addEventListener('click', () => { state.authScreen = el.dataset.authScreen; state.authPrompt = ''; state.authError = ''; render(); }));
   document.querySelectorAll('[data-profile-edit]').forEach(el => el.addEventListener('click', () => { if (!isAuthenticated()) { state.authScreen = 'login'; state.authPrompt = 'سجّل الدخول لتعديل ملفك'; render(); return; } state.active = 'profile-edit'; render(); }));
@@ -622,15 +900,27 @@ function bindEvents() {
       state.active = 'feed';
       persistAuth();
       await hydrateBackendContent();
+      await syncOfflineActions();
       render();
     } catch (error) {
       state.authLoading = false;
-      state.authError = error.message === 'EMAIL_NOT_VERIFIED' ? 'تحقق من بريدك الإلكتروني أولًا.' : error.message === 'SMTP_NOT_CONFIGURED' ? 'البريد الإلكتروني غير مهيأ على الخادم.' : 'البريد الإلكتروني أو كلمة المرور غير صحيحة.';
+      state.authError = authErrorMessage(error);
       render();
     }
   });
-  const profileSetupForm = document.querySelector('[data-profile-setup]'); if (profileSetupForm) profileSetupForm.addEventListener('submit', event => { event.preventDefault(); saveProfileForm(profileSetupForm, true); });
-  const profileEditForm = document.querySelector('[data-profile-edit-form]'); if (profileEditForm) profileEditForm.addEventListener('submit', event => { event.preventDefault(); saveProfileForm(profileEditForm, false); });
+  document.querySelectorAll('[data-request-reset]').forEach(button => button.addEventListener('click', async () => {
+    const email = window.prompt('أدخل البريد الإلكتروني المرتبط بحسابك');
+    if (!email?.trim()) return;
+    try {
+      await api('/auth/request-password-reset', { method: 'POST', body: JSON.stringify({ email: email.trim() }) });
+      state.authError = 'إذا كان البريد مرتبطًا بحساب، فستصلك رسالة استعادة قريبًا.';
+    } catch (error) {
+      state.authError = authErrorMessage(error);
+    }
+    render();
+  }));
+  const profileSetupForm = document.querySelector('[data-profile-setup]'); if (profileSetupForm) profileSetupForm.addEventListener('submit', event => { event.preventDefault(); saveProfileForm(profileSetupForm); });
+  const profileEditForm = document.querySelector('[data-profile-edit-form]'); if (profileEditForm) profileEditForm.addEventListener('submit', event => { event.preventDefault(); saveProfileForm(profileEditForm); });
   document.querySelectorAll('[data-bind-device]').forEach(el => el.addEventListener('click', () => { state.authLoading = true; render(); setTimeout(() => { state.activeUser = state.pendingUser; state.accounts = [...new Map([...state.accounts, state.activeUser].map(user => [user.email, user])).values()]; state.deviceTrusted = true; state.authLoading = false; state.authScreen = state.activeUser.profileSetup === false ? 'forced-profile' : 'guest'; persistAuth(); render(); toast('تم توثيق الجهاز وفتح NEXA'); }, 450); }));
   document.querySelectorAll('[data-add-account]').forEach(el => el.addEventListener('click', () => { state.authScreen = 'login'; state.activeUser = null; state.deviceTrusted = false; state.pendingUser = null; render(); }));
   document.querySelectorAll('[data-switch-account]').forEach(el => el.addEventListener('click', () => { if (state.accounts.length < 2) { toast('أضف حساباً آخر أولاً'); return; } const index = state.accounts.findIndex(user => user.email === state.activeUser.email); state.activeUser = state.accounts[(index + 1) % state.accounts.length]; persistAuth(); render(); toast(`تم التبديل إلى ${state.activeUser.username}`); }));
@@ -638,7 +928,17 @@ function bindEvents() {
   document.querySelectorAll('[data-like]').forEach(el => el.addEventListener('click', async () => { const id = el.dataset.like; if (!isAuthenticated()) { state.authScreen = 'login'; render(); return; } try { const { active } = await api(`/api/posts/${id}/like`, { method: 'POST' }); active ? state.liked.add(id) : state.liked.delete(id); render(); } catch { toast('تعذر تحديث الإعجاب'); } }));
   document.querySelectorAll('[data-save]').forEach(el => el.addEventListener('click', async () => { const id = el.dataset.save; if (!isAuthenticated()) { state.authScreen = 'login'; render(); return; } try { const { active } = await api(`/api/posts/${id}/save`, { method: 'POST' }); active ? state.saved.add(id) : state.saved.delete(id); toast(active ? 'تم حفظ المنشور' : 'أزيل من المحفوظات'); render(); } catch { toast('تعذر تحديث المحفوظات'); } }));
   document.querySelectorAll('[data-comment-post]').forEach(el => el.addEventListener('click', async () => { if (!isAuthenticated()) { state.authScreen = 'login'; state.authPrompt = 'سجّل الدخول للتعليق'; render(); return; } const body = window.prompt('اكتب تعليقك'); if (!body?.trim()) return; try { await api(`/api/posts/${el.dataset.commentPost}/comments`, { method: 'POST', body: JSON.stringify({ body }) }); toast('تم نشر التعليق'); } catch (error) { toast(moderationMessage(error) || 'تعذر نشر التعليق'); } }));
-  document.querySelectorAll('.video-actions .action:not([data-like]):not([data-save])').forEach(el => el.addEventListener('click', () => { if (!isAuthenticated()) { state.authScreen = 'login'; state.authPrompt = 'سجّل الدخول للتعليق والمشاركة'; render(); } }));
+  document.querySelectorAll('.video-actions .action:not([data-like]):not([data-save]):not([data-comment-post]):not([data-report-post])').forEach(button => button.addEventListener('click', async () => {
+    const video = button.closest('.video-card')?.querySelector('[data-video]');
+    const shareData = { title: 'NEXA', text: video?.closest('.video-card')?.querySelector('.video-caption p')?.textContent || 'شاهد هذا الفيديو على NEXA', url: location.href };
+    try {
+      if (navigator.share) await navigator.share(shareData);
+      else if (navigator.clipboard?.writeText) { await navigator.clipboard.writeText(shareData.url); toast('تم نسخ رابط NEXA'); }
+      else toast(shareData.url);
+    } catch (error) {
+      if (error.name !== 'AbortError') toast('تعذرت مشاركة الرابط');
+    }
+  }));
   document.querySelectorAll('[data-follow-person]').forEach(el => el.addEventListener('click', async () => { if (!isAuthenticated()) { state.authScreen = 'login'; render(); return; } try { const { following } = await api(`/api/users/${el.dataset.followPerson}/follow`, { method: 'POST' }); following ? state.subscribed.add(el.dataset.followPerson) : state.subscribed.delete(el.dataset.followPerson); persistFollowing(); toast(following ? 'تمت متابعة الشخص' : 'تم إلغاء المتابعة'); render(); } catch { toast('تعذر تحديث المتابعة'); } }));
   document.querySelectorAll('[data-subscribe]').forEach(el => el.addEventListener('click', () => toast('تحتاج القنوات إلى ربط مالكها بحساب المستخدم أولًا')));
   document.querySelectorAll('[data-play]').forEach(el => el.addEventListener('click', event => { event.stopPropagation(); const video = document.querySelector(`[data-video="${el.dataset.play}"]`); if (!video) return; if (video.paused) video.play().catch(() => {}); else video.pause(); }));
@@ -650,7 +950,33 @@ function bindEvents() {
       render();
     });
   });
-  const form = document.querySelector('.composer'); if (form) form.addEventListener('submit', async e => { e.preventDefault(); const input = document.querySelector('#message-input'); const text = input.value.trim(); if (!text) return; const recipientId = state.selectedRecipientId || state.conversationUsers[0]?.userId; if (!recipientId) { toast('اختر مستخدمًا لبدء المحادثة'); return; } try { const { message } = await api('/api/messages', { method: 'POST', body: JSON.stringify({ recipientId, body: text }) }); state.remoteMessages.push({ id: message.id, from: 'me', body: message.body, createdAt: message.createdAt }); input.value = ''; render(); } catch { toast('تعذر إرسال الرسالة'); } });
+  const pendingStreamList = document.querySelector('.stream-list');
+  if (pendingStreamList) {
+    const pendingVideos = state.offlineActions.filter(action => action.type === 'video' && action.userId === state.activeUser?.id);
+    if (pendingVideos.length) {
+      pendingStreamList.insertAdjacentHTML('afterbegin', pendingVideos.map(action => `<article class="offline-video-item"><strong>فيديو محفوظ على هذا الجهاز</strong><small>${escapeHtml(action.file.name)}</small><small>${action.status === 'needs-review' ? 'تعذرت المزامنة؛ احذف العنصر أو أعد المحاولة لاحقًا.' : 'سينشر بعد عودة الاتصال.'}</small><button class="offline-remove" data-remove-offline="${escapeHtml(action.id)}">حذف</button></article>`).join(''));
+    }
+  }
+  const form = document.querySelector('.composer'); if (form) form.addEventListener('submit', async event => {
+    event.preventDefault();
+    const input = document.querySelector('#message-input');
+    const text = input.value.trim();
+    const recipientId = state.selectedRecipientId || state.conversationUsers[0]?.userId;
+    if (!text) return;
+    if (!recipientId) { toast('افتح محادثة متاحة قبل إرسال الرسالة'); return; }
+    if (localModerationCheck(text)) { toast('لم تُرسل الرسالة: رفضها الفحص المحلي'); return; }
+    const action = { id: crypto.randomUUID(), type: 'message', userId: state.activeUser?.id, recipientId, body: text };
+    input.value = '';
+    try {
+      await enqueueAction(action);
+      await syncOfflineActions();
+      render();
+      toast(navigator.onLine ? 'حُفظت الرسالة وبدأ إرسالها' : 'حُفظت الرسالة على الجهاز وستُرسل عند عودة الاتصال');
+    } catch {
+      input.value = text;
+      toast('تعذر حفظ الرسالة على هذا الجهاز');
+    }
+  });
   const streamList = document.querySelector('.stream-list'); if (streamList) { let startY = 0; streamList.addEventListener('touchstart', event => { startY = event.touches[0].clientY; }, { passive: true }); streamList.addEventListener('touchend', event => { const delta = startY - event.changedTouches[0].clientY; if (Math.abs(delta) > 60) { const cards = [...streamList.querySelectorAll('.video-card')]; const current = Math.max(0, cards.findIndex(card => card.getBoundingClientRect().top >= streamList.getBoundingClientRect().top)); const next = delta > 0 ? cards[Math.min(current + 1, cards.length - 1)] : cards[Math.max(current - 1, 0)]; next?.scrollIntoView({ behavior: 'smooth', block: 'nearest' }); } }, { passive: true }); }
   setupVideoAutoplay();
 }
@@ -658,3 +984,13 @@ function bindEvents() {
 render();
 hydrateBackendSession();
 hydrateBackendContent();
+refreshOfflineActions().then(() => syncOfflineActions());
+window.addEventListener('online', () => {
+  state.online = true;
+  updateOfflineIndicator();
+  syncOfflineActions();
+});
+window.addEventListener('offline', () => {
+  state.online = false;
+  updateOfflineIndicator();
+});

@@ -15,6 +15,14 @@ test('social API exposes persistent content operations', () => {
   assert.match(server, /like\|save/);
 });
 
+test('authenticated users can discover chat recipients with public profile fields only', () => {
+  assert.match(server, /url\.pathname === '\/api\/users'[\s\S]*?authenticatedUser\(request\)/);
+  assert.match(server, /select: \{ id: true, username: true, displayName: true, avatarUrl: true, verification: true \}/);
+  const app = fs.readFileSync(new URL('../src/main.js', import.meta.url), 'utf8');
+  assert.match(app, /api\('\/api\/users'\)/);
+  assert.match(app, /cacheConversation\(`contacts:\$\{state\.activeUser\.id\}`/);
+});
+
 test('database schema contains persistent interactions and auth tokens', () => {
   for (const model of ['model PostLike', 'model PostSave', 'model EmailToken']) assert.match(schema, new RegExp(model));
   for (const table of ['post_likes', 'post_saves', 'email_tokens']) assert.match(sql, new RegExp(`CREATE TABLE IF NOT EXISTS ${table}`));
@@ -24,6 +32,13 @@ test('developer access is checked by the server owner role', () => {
   assert.match(server, /url\.pathname === '\/api\/owner\/status'/);
   assert.match(server, /user\?\.role === 'owner'/);
   assert.doesNotMatch(server, /localStorage/);
+});
+
+test('owner bootstrap requires the configured verified email and Google-verified email', () => {
+  assert.match(server, /OWNER_EMAIL/);
+  assert.match(server, /OWNER_BOOTSTRAP_NOT_ALLOWED/);
+  assert.match(server, /profile\.email_verified !== true/);
+  assert.doesNotMatch(server, /role:\s*firstUser\s*===\s*0\s*\?\s*'owner'/);
 });
 
 test('state-changing API requests require CSRF protection', () => {
@@ -36,6 +51,51 @@ test('frontend hydrates real conversations and accepts the server owner role', (
   const app = fs.readFileSync(new URL('../src/main.js', import.meta.url), 'utf8');
   assert.match(app, /hydrate.*Messages|load.*Conversation|selected.*recipient/i);
   assert.match(app, /role === 'owner'|role === 'boss'/i);
+});
+
+test('login UI matches backend password rules, explains service failures, and wires password reset', () => {
+  const app = fs.readFileSync(new URL('../src/main.js', import.meta.url), 'utf8');
+  assert.match(app, /function authErrorMessage\(error\)/);
+  assert.match(app, /SERVICES_UNAVAILABLE/);
+  assert.match(app, /data-request-reset/);
+  assert.match(app, /minlength="8"/);
+  assert.match(app, /auth\/request-password-reset/);
+});
+
+test('corrupt browser storage and render exceptions cannot leave an empty app root', () => {
+  const app = fs.readFileSync(new URL('../src/main.js', import.meta.url), 'utf8');
+  assert.match(app, /function readLocalJson\([\s\S]*?JSON\.parse\(readLocalValue\([\s\S]*?return fallback/);
+  assert.match(app, /isUserRecord\(user\)/);
+  assert.doesNotMatch(app, /nexa-users.*removeLocalValue|removeLocalValue\).*nexa-accounts/);
+  assert.match(app, /NEXA render failed/);
+  assert.match(app, /تعذر عرض الصفحة/);
+  assert.match(app, /id="reload-app"/);
+  assert.match(app, /controllerchange'[\s\S]*?window\.location\.reload/);
+  assert.match(app, /registration\.update\(\)/);
+});
+
+test('Google profile setup hydrates its pending user and persists completed status', () => {
+  const app = fs.readFileSync(new URL('../src/main.js', import.meta.url), 'utf8');
+  assert.match(app, /state\.pendingUser = needsProfileSetup \? state\.activeUser : null/);
+  assert.match(app, /state\.authScreen = needsProfileSetup \? 'forced-profile' : 'guest'/);
+  assert.match(server, /data: \{ \.\.\.parsed\.data, status: 'active' \}/);
+  assert.match(server, /JSON\.stringify\(buildSessionUser\(updated\)\)/);
+  assert.match(server, /needsProfileSetup \? '\/setup-profile' : '\/home'/);
+  const saveProfile = app.match(/async function saveProfileForm\(form\) \{[\s\S]*?\n\}/)?.[0] || '';
+  assert.match(saveProfile, /state\.active = 'feed'/);
+  assert.match(saveProfile, /state\.authScreen = 'guest'/);
+  assert.doesNotMatch(saveProfile, /authScreen = 'device'/);
+  assert.match(saveProfile, /authErrorMessage\(error\)/);
+  assert.match(server, /error\.code === 'P2002'[\s\S]*?USERNAME_IN_USE/);
+});
+
+test('username rules are shared by the browser and API', () => {
+  const app = fs.readFileSync(new URL('../src/main.js', import.meta.url), 'utf8');
+  const validation = fs.readFileSync(new URL('../shared/validation.js', import.meta.url), 'utf8');
+  assert.match(validation, /\^\[A-Za-z\]\[A-Za-z0-9_\]\{2,19\}\$/);
+  assert.match(app, /USERNAME_PATTERN\.test\(username\)/);
+  assert.match(server, /z\.string\(\)\.regex\(USERNAME_PATTERN\)/);
+  assert.match(server, /mode: 'insensitive'/);
 });
 
 test('authenticated users can fetch and clear notifications from the backend', () => {
@@ -88,8 +148,15 @@ test('video moderation jobs are started, associated with posts, and polled', () 
   assert.match(app, /moderationJobId/);
   assert.match(app, /media-moderation-consent/);
   assert.match(app, /عند تفعيل التكامل يُرسل إلى AWS/);
-  assert.match(schema, /moderationJobId String\?/);
+  assert.match(schema, /moderationJobId\s+String\?/);
   assert.match(compose, /AWS_REKOGNITION_SNS_TOPIC_ARN/);
+});
+
+test('video uploads enforce request-size and in-process concurrency limits', () => {
+  assert.match(server, /MAX_MEDIA_UPLOAD_BYTES = 100 \* 1024 \* 1024/);
+  assert.match(server, /MAX_CONCURRENT_MEDIA_UPLOADS = 2/);
+  assert.match(server, /MEDIA_TOO_LARGE/);
+  assert.match(server, /UPLOAD_CAPACITY_REACHED/);
 });
 
 test('text moderation preview uses the same central blocklist', () => {
@@ -97,10 +164,25 @@ test('text moderation preview uses the same central blocklist', () => {
 });
 
 test('service worker never caches authenticated API or auth responses', () => {
-  assert.match(serviceWorker, /CACHE_NAME = 'nexa-cache-v2'/);
+  assert.match(serviceWorker, /CACHE_NAME = 'nexa-cache-v6'/);
   assert.match(serviceWorker, /pathname\.startsWith\('\/api\/'\)/);
   assert.match(serviceWorker, /pathname\.startsWith\('\/auth\/'\)/);
   assert.match(serviceWorker, /if \(pathname === '\/api'[\s\S]*?return;/);
+});
+
+test('offline outbox persists messages and media and uses stable retry identifiers', () => {
+  const app = fs.readFileSync(new URL('../src/main.js', import.meta.url), 'utf8');
+  const offlineStore = fs.readFileSync(new URL('../src/offline-store.js', import.meta.url), 'utf8');
+  assert.match(app, /queueOfflineAction\(/);
+  assert.match(app, /window\.addEventListener\('online'/);
+  assert.match(app, /clientId: action\.id/);
+  assert.match(app, /form\.append\('uploadId', action\.id\)/);
+  assert.match(app, /navigator\.mediaDevices\?\.getUserMedia/);
+  assert.match(app, /new MediaRecorder\(/);
+  assert.match(offlineStore, /indexedDB\.open/);
+  assert.match(server, /media_upload:\$\{user\.id\}:\$\{uploadId\}/);
+  assert.match(server, /existingMessage = await prisma\.message\.findUnique/);
+  assert.match(server, /existingPost = await prisma\.post\.findUnique/);
 });
 
 test('owner telemetry and audit access exist for production-grade governance', () => {
@@ -112,14 +194,110 @@ test('owner telemetry and audit access exist for production-grade governance', (
 test('production deployment config exists for web hosting and container runtime', () => {
   const dockerfile = fs.existsSync(new URL('../Dockerfile', import.meta.url)) ? fs.readFileSync(new URL('../Dockerfile', import.meta.url), 'utf8') : '';
   const compose = fs.readFileSync(new URL('../docker-compose.yml', import.meta.url), 'utf8');
-  assert.match(server, /server\.listen\(port, '0\.0\.0\.0'/);
-  assert.match(dockerfile, /FROM/);
+  assert.match(server, /server\.listen\(port, process\.env\.HOST \|\| '0\.0\.0\.0'/);
+  assert.match(dockerfile, /FROM node:22-alpine/);
+  assert.match(dockerfile, /EXPOSE 5173/);
+  assert.match(dockerfile, /npm ci/);
+  assert.match(dockerfile, /USER node/);
   assert.match(compose, /image:.*nexa|build:/i);
 });
 
-test('server stays alive in degraded mode when infrastructure is unavailable', () => {
-  assert.doesNotMatch(server, /process\.exitCode = 1/);
+test('PWA install metadata references generated Android and Apple icons', () => {
+  const manifest = JSON.parse(fs.readFileSync(new URL('../public/manifest.webmanifest', import.meta.url), 'utf8'));
+  const appHtml = fs.readFileSync(new URL('../index.html', import.meta.url), 'utf8');
+  const logo = fs.readFileSync(new URL('../public/icon.svg', import.meta.url), 'utf8');
+  const brandStyles = fs.readFileSync(new URL('../src/brand-refresh.css', import.meta.url), 'utf8');
+  for (const path of ['/icon-192.png', '/icon-512.png', '/icon-maskable-512.png', '/apple-touch-icon.png']) {
+    assert.ok(fs.existsSync(new URL(`../public${path}`, import.meta.url)), `${path} should exist`);
+  }
+  assert.match(appHtml, /apple-touch-icon\.png/);
+  assert.match(logo, /fill="#071009"/);
+  assert.match(logo, /fill="#a8ff35"/);
+  assert.match(brandStyles, /background: #071009 url\('\/icon\.svg'\)/);
+  assert.equal(manifest.icons.length, 3);
+  assert.match(server, /'\.webmanifest': 'application\/manifest\+json; charset=utf-8'/);
+  assert.match(server, /'\.png': 'image\/png'/);
+});
+
+test('database baseline stays in sync and production applies migrations before startup', () => {
+  const migration = fs.readFileSync(new URL('../prisma/migrations/20261001000000_initial_schema/migration.sql', import.meta.url), 'utf8');
+  const packageJson = JSON.parse(fs.readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
+  const dockerfile = fs.readFileSync(new URL('../Dockerfile', import.meta.url), 'utf8');
+  assert.equal(migration.trimEnd(), sql.trimEnd());
+  assert.match(schema, /@@map\("users"\)/);
+  assert.match(packageJson.scripts['db:migrate'], /prisma migrate deploy/);
+  assert.match(packageJson.scripts['db:baseline'], /prisma migrate resolve --applied/);
+  assert.match(packageJson.scripts['db:migrate:local'], /--env-file=\.env\.local/);
+  assert.match(packageJson.scripts['dev:all'], /db:migrate:local && concurrently/);
+  assert.match(dockerfile, /npm run db:migrate && node server\/index\.js/);
+});
+
+test('legacy Prisma migration renames User without dropping the table', () => {
+  const migration = fs.readFileSync(new URL('../prisma/migrations/20261002000000_upgrade_legacy_prisma_schema/migration.sql', import.meta.url), 'utf8');
+  assert.match(migration, /ALTER TABLE public\."User" RENAME TO users/);
+  assert.match(migration, /ALTER COLUMN %I TYPE TEXT USING %I::text/);
+  assert.doesNotMatch(migration, /DROP TABLE.*User/i);
+});
+
+test('object storage supports managed AWS S3 and keeps local MinIO optional', () => {
+  const services = fs.readFileSync(new URL('../server/services.js', import.meta.url), 'utf8');
+  const compose = fs.readFileSync(new URL('../docker-compose.yml', import.meta.url), 'utf8');
+  assert.match(services, /storageProvider === 'aws'/);
+  assert.match(services, /process\.env\.AWS_ACCESS_KEY_ID/);
+  assert.match(services, /!process\.env\[key\]\.trim\(\)/);
+  assert.match(services, /must be configured together/);
+  assert.match(compose, /S3_PROVIDER: \$\{S3_PROVIDER:-minio\}/);
+  assert.match(compose, /profiles: \[local-storage\]/);
+  assert.match(compose, /bitnamilegacy\/minio:2025\.5\.24-debian-12-r5/);
+});
+
+test('the app has one public origin and keeps the development backend private', () => {
+  const vite = fs.readFileSync(new URL('../vite.config.js', import.meta.url), 'utf8');
+  const packageJson = JSON.parse(fs.readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
+  const envExample = fs.readFileSync(new URL('../.env.example', import.meta.url), 'utf8');
+  assert.match(vite, /port:\s*5173/);
+  assert.match(vite, /http:\/\/127\.0\.0\.1:4001/);
+  assert.match(packageJson.scripts['dev:all'], /npm run server.*npm run dev/);
+  assert.match(packageJson.scripts.server, /HOST=127\.0\.0\.1 PORT=4001/);
+  assert.match(envExample, /APP_ORIGIN=http:\/\/localhost:5173/);
+  assert.match(envExample, /GOOGLE_REDIRECT_URI=http:\/\/localhost:5173\/auth\/google\/callback/);
+  assert.match(server, /'http:\/\/localhost:5173'/);
+  assert.doesNotMatch(server, /localhost:4000/);
+});
+
+test('development accepts only HTTPS Codespaces origins forwarding port 5173', () => {
+  assert.match(server, /function isCodespacesOrigin\(origin\)/);
+  assert.match(server, /url\.protocol === 'https:'/);
+  assert.match(server, /\[a-z0-9-\]\+-5173\\\.app\\\.github\\\.dev/);
+  assert.match(server, /process\.env\.NODE_ENV !== 'production' && \(origin === 'http:\/\/localhost:5173' \|\| isCodespacesOrigin\(origin\)\)/);
+});
+
+test('compose requires secrets, gates startup on healthy services, and keeps data ports private', () => {
+  const compose = fs.readFileSync(new URL('../docker-compose.yml', import.meta.url), 'utf8');
+  assert.match(compose, /PORT: 5173/);
+  assert.match(compose, /"5173:5173"/);
+  assert.match(compose, /127\.0\.0\.1:5173\/api\/health/);
+  assert.match(compose, /POSTGRES_PASSWORD:\s*\$\{POSTGRES_PASSWORD:\?/);
+  assert.match(compose, /SESSION_SECRET:\s*\$\{SESSION_SECRET:\?/);
+  assert.match(compose, /OWNER_EMAIL:\s*\$\{OWNER_EMAIL:\?/);
+  assert.match(compose, /MINIO_SECRET_KEY: \$\{MINIO_SECRET_KEY:-local-storage-dev-only\}/);
+  assert.match(compose, /profiles: \[local-storage\]/);
+  assert.match(compose, /condition: service_healthy/);
+  assert.match(compose, /internal: true/);
+  assert.match(compose, /127\.0\.0\.1:9000:9000/);
+  assert.doesNotMatch(compose, /"(?:5432|6379|9000|9001):/);
+  assert.doesNotMatch(compose, /change-me(?:-now)?/);
+});
+
+test('production fails closed when infrastructure or rate limiting is unavailable', () => {
+  assert.match(server, /process\.env\.NODE_ENV === 'production' \? null : true/);
+  assert.match(server, /RATE_LIMIT_UNAVAILABLE/);
+  assert.match(server, /await disconnectServices\(\);[\s\S]*?process\.exitCode = 1/);
+});
+
+test('development server stays alive in degraded mode when infrastructure is unavailable', () => {
   assert.match(server, /degraded mode|servicesReady = false|servicesReady\s*=\s*false/i);
+  assert.match(server, /if \(process\.env\.NODE_ENV === 'production'\)[\s\S]*?process\.exitCode = 1[\s\S]*?server\.listen/);
 });
 
 test('guest users get a safe unauthenticated response instead of a fatal 401 page issue', () => {
@@ -146,4 +324,6 @@ test('Google login uses a backend-generated state and redirects to the profile s
   assert.match(server, /\/setup-profile|setup-profile/i);
   assert.match(server, /nexa_oauth_session/i);
   assert.match(server, /Set-Cookie[\s\S]*nexa_oauth_session/i);
+  assert.match(server, /identities: \{ some: \{ provider: 'google'/);
+  assert.doesNotMatch(server, /authIdentities/);
 });

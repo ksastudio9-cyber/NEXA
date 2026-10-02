@@ -11,15 +11,20 @@ import { connectServices, disconnectServices, prisma, redis, s3, moderationS3, r
 import { sendSecurityMail, smtpEnabled } from './mailer.js';
 import { contentCheck } from './moderation.js';
 import { inspectVideoModeration } from './media-moderation.js';
+import { USERNAME_PATTERN } from '../shared/validation.js';
 
 const port = Number(process.env.PORT || 4000);
-const appOrigin = process.env.APP_ORIGIN || process.env.FRONTEND_ORIGIN || 'https://automatic-happiness-9655vrgx6jw9hpp9p-5173.app.github.dev';
+const appOrigin = process.env.APP_ORIGIN || process.env.FRONTEND_ORIGIN || 'http://localhost:5173';
+const mediaBucket = process.env.S3_BUCKET || process.env.MINIO_BUCKET || 'nexa-media';
 const sessionSecret = process.env.SESSION_SECRET;
 const jwtSecret = process.env.JWT_SECRET || sessionSecret;
 let servicesReady = false;
 const startedAt = Date.now();
 let requestCount = 0;
 let errorCount = 0;
+const MAX_MEDIA_UPLOAD_BYTES = 100 * 1024 * 1024;
+const MAX_CONCURRENT_MEDIA_UPLOADS = 2;
+let activeMediaUploads = 0;
 
 function json(response, status, body) {
   response.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', 'Access-Control-Allow-Origin': appOrigin, 'Access-Control-Allow-Credentials': 'true' });
@@ -34,13 +39,24 @@ function securityHeaders(response) {
   response.setHeader('Content-Security-Policy', "default-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'");
 }
 
+function isCodespacesOrigin(origin) {
+  try {
+    const url = new URL(origin);
+    return url.protocol === 'https:' && !url.port && /^[a-z0-9-]+-5173\.app\.github\.dev$/i.test(url.hostname);
+  } catch {
+    return false;
+  }
+}
+
 function allowedOrigin(origin) {
   if (!origin) return true;
-  return origin === appOrigin || (process.env.NODE_ENV !== 'production' && origin === 'http://localhost:5173');
+  if (origin === appOrigin) return true;
+  return process.env.NODE_ENV !== 'production' && (origin === 'http://localhost:5173' || isCodespacesOrigin(origin));
 }
 
 async function rateLimit(request, pathname) {
-  if (!servicesReady) return true;
+  if (!pathname.startsWith('/api/') && !pathname.startsWith('/auth/')) return true;
+  if (!servicesReady) return process.env.NODE_ENV === 'production' ? null : true;
   const ip = request.headers['x-forwarded-for']?.split(',')[0].trim() || request.socket.remoteAddress || 'unknown';
   const group = pathname.startsWith('/auth') ? 'auth' : 'api';
   const limit = group === 'auth' ? 30 : 180;
@@ -50,7 +66,7 @@ async function rateLimit(request, pathname) {
     if (count === 1) await redis.expire(key, 60);
     return count <= limit;
   } catch {
-    return true;
+    return process.env.NODE_ENV === 'production' ? null : true;
   }
 }
 
@@ -111,6 +127,16 @@ function buildSessionUser(user) {
 }
 
 const credentialsSchema = z.object({ email: z.string().email().max(254), password: z.string().min(8).max(128) });
+
+function usernamePrefix(value) {
+  const cleaned = String(value || '').replace(/[^A-Za-z0-9_]/g, '_').replace(/^_+/, '').slice(0, 14);
+  return /^[A-Za-z]/.test(cleaned) ? cleaned : `u_${cleaned || 'user'}`.slice(0, 14);
+}
+
+function generatedUsername(value, suffix) {
+  const safeSuffix = String(suffix || '0').replace(/[^A-Za-z0-9]/g, '').slice(-4) || '0';
+  return `${usernamePrefix(value)}_${safeSuffix}`.slice(0, 20);
+}
 
 function publicUser(user) {
   const { passwordHash, ...safeUser } = user;
@@ -299,7 +325,9 @@ async function handle(request, response) {
   securityHeaders(response);
 
   if (!allowedOrigin(request.headers.origin)) return json(response, 403, { error: 'ORIGIN_NOT_ALLOWED' });
-  if (!await rateLimit(request, url.pathname)) return json(response, 429, { error: 'RATE_LIMITED' });
+  const rateLimitResult = url.pathname === '/api/health' ? true : await rateLimit(request, url.pathname);
+  if (rateLimitResult === null) return json(response, 503, { error: 'RATE_LIMIT_UNAVAILABLE' });
+  if (!rateLimitResult) return json(response, 429, { error: 'RATE_LIMITED' });
 
   if (request.method === 'OPTIONS') {
     response.writeHead(204, { 'Access-Control-Allow-Origin': appOrigin, 'Access-Control-Allow-Credentials': 'true', 'Access-Control-Allow-Methods': 'GET, POST, PATCH, DELETE, OPTIONS', 'Access-Control-Allow-Headers': 'Content-Type, X-CSRF-Token' });
@@ -341,6 +369,8 @@ async function handle(request, response) {
     const user = await authenticatedUser(request);
     if (!user) return json(response, 401, { error: 'AUTH_REQUIRED' });
     if (user.role === 'owner') return json(response, 200, { owner: true, claimed: false });
+    const bootstrapOwnerEmail = String(process.env.OWNER_EMAIL || '').trim().toLowerCase();
+    if (!bootstrapOwnerEmail || user.email?.toLowerCase() !== bootstrapOwnerEmail || user.emailVerified !== true) return json(response, 403, { error: 'OWNER_BOOTSTRAP_NOT_ALLOWED' });
     const claim = await redis.set('nexa:developer:first-owner', user.id, 'NX');
     if (claim !== 'OK') return json(response, 403, { error: 'DEVELOPER_AREA_LOCKED' });
     const owner = await prisma.user.findFirst({ where: { role: 'owner' }, select: { id: true } });
@@ -358,7 +388,7 @@ async function handle(request, response) {
     const body = await readBody(request);
     const parsed = z.object({
       displayName: z.string().trim().min(2).max(30),
-      username: z.string().regex(/^[A-Za-z0-9_]+$/).min(3).max(20),
+      username: z.string().regex(USERNAME_PATTERN),
       bio: z.string().trim().max(280).optional(),
       avatarUrl: z.string().url().max(2048).nullable().optional(),
       bannerUrl: z.string().url().max(2048).nullable().optional(),
@@ -367,9 +397,17 @@ async function handle(request, response) {
     }).safeParse(body);
     if (!parsed.success) return json(response, 400, { error: 'INVALID_PROFILE' });
     if (contentCheck(`${parsed.data.displayName} ${parsed.data.bio || ''}`)) return json(response, 422, { error: 'CONTENT_REJECTED' });
-    const duplicate = await prisma.user.findFirst({ where: { username: parsed.data.username, NOT: { id: user.id } } });
+    const duplicate = await prisma.user.findFirst({ where: { username: { equals: parsed.data.username, mode: 'insensitive' }, NOT: { id: user.id } } });
     if (duplicate) return json(response, 409, { error: 'USERNAME_IN_USE' });
-    const updated = await prisma.user.update({ where: { id: user.id }, data: parsed.data });
+    let updated;
+    try {
+      updated = await prisma.user.update({ where: { id: user.id }, data: { ...parsed.data, status: 'active' } });
+    } catch (error) {
+      if (error.code === 'P2002') return json(response, 409, { error: 'USERNAME_IN_USE' });
+      throw error;
+    }
+    const sessionToken = parseCookies(request).nexa_session || '';
+    if (sessionToken) await redis.set(`session:${sessionToken}`, JSON.stringify(buildSessionUser(updated)), 'EX', 15 * 60);
     return json(response, 200, { user: publicUser(updated) });
   }
 
@@ -397,6 +435,18 @@ async function handle(request, response) {
       prisma.session.findMany({ where: { userId: user.id, revokedAt: null, expiresAt: { gt: new Date() } }, orderBy: { createdAt: 'desc' }, select: { id: true, createdAt: true, expiresAt: true } })
     ]);
     return json(response, 200, { mfaEnabled: user.mfaEnabled, devices, loginHistory, sessions });
+  }
+
+  if (request.method === 'GET' && url.pathname === '/api/users') {
+    const user = await authenticatedUser(request);
+    if (!user) return json(response, 401, { error: 'AUTH_REQUIRED' });
+    const users = await prisma.user.findMany({
+      where: { id: { not: user.id }, status: 'active' },
+      orderBy: { username: 'asc' },
+      take: 50,
+      select: { id: true, username: true, displayName: true, avatarUrl: true, verification: true }
+    });
+    return json(response, 200, { users });
   }
 
   if (request.method === 'GET' && url.pathname === '/api/search') {
@@ -436,9 +486,14 @@ async function handle(request, response) {
     const body = await readBody(request);
     const text = requireText(body?.body);
     const mediaUrl = typeof body?.mediaUrl === 'string' ? body.mediaUrl.slice(0, 2048) : null;
+    const clientId = typeof body?.clientId === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(body.clientId) ? body.clientId : null;
     const visibility = ['public', 'followers', 'private'].includes(body?.visibility) ? body.visibility : 'public';
     if (!text && !mediaUrl) return json(response, 400, { error: 'POST_CONTENT_REQUIRED' });
     if (contentCheck(text)) return json(response, 422, { error: 'CONTENT_REJECTED' });
+    if (clientId) {
+      const existingPost = await prisma.post.findUnique({ where: { id: clientId }, include: { author: { select: { id: true, username: true, displayName: true, avatarUrl: true, verification: true } }, _count: { select: { likes: true, comments: true } } } });
+      if (existingPost) return existingPost.authorId === user.id ? json(response, 200, { post: publicPost(existingPost, user.id) }) : json(response, 409, { error: 'CLIENT_ID_IN_USE' });
+    }
     let moderationJobId = null;
     let moderationS3Key = null;
     if (typeof body?.moderationJobId === 'string') {
@@ -449,7 +504,7 @@ async function handle(request, response) {
       moderationJobId = body.moderationJobId;
       moderationS3Key = pendingUpload.moderationS3Key;
     }
-    const post = await prisma.post.create({ data: { authorId: user.id, body: text || '', mediaUrl, visibility, moderationStatus: 'pending', moderationJobId, moderationS3Key }, include: { author: { select: { id: true, username: true, displayName: true, avatarUrl: true, verification: true } }, _count: { select: { likes: true, comments: true } } } });
+    const post = await prisma.post.create({ data: { ...(clientId ? { id: clientId } : {}), authorId: user.id, body: text || '', mediaUrl, visibility, moderationStatus: 'pending', moderationJobId, moderationS3Key }, include: { author: { select: { id: true, username: true, displayName: true, avatarUrl: true, verification: true } }, _count: { select: { likes: true, comments: true } } } });
     if (moderationJobId) await redis.del(`media_moderation:${moderationJobId}`);
     return json(response, 201, { post: publicPost(post, user.id) });
   }
@@ -693,9 +748,14 @@ async function handle(request, response) {
     const text = requireText(body?.body, 2000);
     const recipientId = typeof body?.recipientId === 'string' ? body.recipientId : null;
     const channelId = typeof body?.channelId === 'string' ? body.channelId : null;
+    const clientId = typeof body?.clientId === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(body.clientId) ? body.clientId : null;
     if (!text || (recipientId && channelId) || (!recipientId && !channelId)) return json(response, 400, { error: 'INVALID_MESSAGE' });
     if (contentCheck(text)) return json(response, 422, { error: 'CONTENT_REJECTED' });
-    const message = await prisma.message.create({ data: { senderId: user.id, recipientId, channelId, body: text }, select: { id: true, senderId: true, recipientId: true, channelId: true, body: true, createdAt: true } });
+    if (clientId) {
+      const existingMessage = await prisma.message.findUnique({ where: { id: clientId } });
+      if (existingMessage) return existingMessage.senderId === user.id ? json(response, 200, { message: existingMessage }) : json(response, 409, { error: 'CLIENT_ID_IN_USE' });
+    }
+    const message = await prisma.message.create({ data: { ...(clientId ? { id: clientId } : {}), senderId: user.id, recipientId, channelId, body: text }, select: { id: true, senderId: true, recipientId: true, channelId: true, body: true, createdAt: true } });
     if (recipientId) broadcastEvent(recipientId, { type: 'message', message });
     return json(response, 201, { message });
   }
@@ -703,36 +763,52 @@ async function handle(request, response) {
   if (request.method === 'POST' && url.pathname === '/api/media') {
     const user = await authenticatedUser(request);
     if (!user) return json(response, 401, { error: 'AUTH_REQUIRED' });
-    const contentType = request.headers['content-type'] || '';
-    const raw = await readRawBody(request);
-    const multipart = raw && parseMultipart(contentType, raw);
-    if (!multipart?.file || !/^video\/(mp4|webm|quicktime|x-matroska)$/.test(multipart.file.contentType)) return json(response, 400, { error: 'VIDEO_REQUIRED' });
-    const extension = multipart.file.filename.split('.').pop()?.toLowerCase().replace(/[^a-z0-9]/g, '') || 'mp4';
-    const key = `users/${user.id}/${randomBytes(16).toString('hex')}.${extension}`;
-    await s3.send(new PutObjectCommand({ Bucket: process.env.MINIO_BUCKET || 'nexa-media', Key: key, Body: multipart.file.buffer, ContentType: multipart.file.contentType, Metadata: { ownerId: user.id } }));
-    const mediaUrl = `/api/media/${encodeURIComponent(key)}`;
-    let moderationJobId = null;
-    let moderationS3Key = null;
-    if (mediaModerationEnabled() && ['video/mp4', 'video/quicktime'].includes(multipart.file.contentType)) {
-      moderationS3Key = `pending/${user.id}/${randomBytes(16).toString('hex')}.${extension}`;
-      try {
-        const bucket = process.env.AWS_S3_BUCKET;
-        await moderationS3.send(new PutObjectCommand({ Bucket: bucket, Key: moderationS3Key, Body: multipart.file.buffer, ContentType: multipart.file.contentType }));
-        const scan = await rekognition.send(new StartContentModerationCommand({
-          Video: { S3Object: { Bucket: bucket, Name: moderationS3Key } },
-          NotificationChannel: { SNSTopicArn: process.env.AWS_REKOGNITION_SNS_TOPIC_ARN, RoleArn: process.env.AWS_REKOGNITION_ROLE_ARN },
-          MinConfidence: Number(process.env.AWS_REKOGNITION_MIN_CONFIDENCE || 75)
-        }));
-        if (!scan.JobId) throw new Error('REKOGNITION_JOB_ID_MISSING');
-        moderationJobId = scan.JobId;
-        await redis.set(`media_moderation:${moderationJobId}`, JSON.stringify({ userId: user.id, mediaUrl, moderationS3Key }), 'EX', 24 * 60 * 60);
-      } catch (error) {
-        await moderationS3.send(new DeleteObjectCommand({ Bucket: process.env.AWS_S3_BUCKET, Key: moderationS3Key })).catch(() => {});
-        console.error('AWS media moderation could not start:', error.message);
-        return json(response, 503, { error: 'MEDIA_MODERATION_UNAVAILABLE' });
+    if (activeMediaUploads >= MAX_CONCURRENT_MEDIA_UPLOADS) return json(response, 503, { error: 'UPLOAD_CAPACITY_REACHED' });
+    activeMediaUploads += 1;
+    try {
+      const contentType = request.headers['content-type'] || '';
+      const contentLength = Number(request.headers['content-length'] || 0);
+      if (contentLength > MAX_MEDIA_UPLOAD_BYTES) return json(response, 413, { error: 'MEDIA_TOO_LARGE' });
+      const raw = await readRawBody(request, MAX_MEDIA_UPLOAD_BYTES);
+      if (!raw) return json(response, 413, { error: 'MEDIA_TOO_LARGE' });
+      const multipart = parseMultipart(contentType, raw);
+      if (!multipart?.file || !/^video\/(mp4|webm|quicktime|x-matroska)$/.test(multipart.file.contentType)) return json(response, 400, { error: 'VIDEO_REQUIRED' });
+      const uploadId = multipart.fields.uploadId || randomBytes(16).toString('hex');
+      if (multipart.fields.uploadId && !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(uploadId)) return json(response, 400, { error: 'INVALID_UPLOAD_ID' });
+      const uploadCacheKey = `media_upload:${user.id}:${uploadId}`;
+      const previousUpload = await redis.get(uploadCacheKey);
+      if (previousUpload) return json(response, 200, JSON.parse(previousUpload));
+      const extension = multipart.file.filename.split('.').pop()?.toLowerCase().replace(/[^a-z0-9]/g, '') || 'mp4';
+      const key = `users/${user.id}/${uploadId.replaceAll('-', '')}.${extension}`;
+      await s3.send(new PutObjectCommand({ Bucket: mediaBucket, Key: key, Body: multipart.file.buffer, ContentType: multipart.file.contentType, Metadata: { ownerId: user.id } }));
+      const mediaUrl = `/api/media/${encodeURIComponent(key)}`;
+      let moderationJobId = null;
+      let moderationS3Key = null;
+      if (mediaModerationEnabled() && ['video/mp4', 'video/quicktime'].includes(multipart.file.contentType)) {
+        moderationS3Key = `pending/${user.id}/${randomBytes(16).toString('hex')}.${extension}`;
+        try {
+          const bucket = process.env.AWS_S3_BUCKET;
+          await moderationS3.send(new PutObjectCommand({ Bucket: bucket, Key: moderationS3Key, Body: multipart.file.buffer, ContentType: multipart.file.contentType }));
+          const scan = await rekognition.send(new StartContentModerationCommand({
+            Video: { S3Object: { Bucket: bucket, Name: moderationS3Key } },
+            NotificationChannel: { SNSTopicArn: process.env.AWS_REKOGNITION_SNS_TOPIC_ARN, RoleArn: process.env.AWS_REKOGNITION_ROLE_ARN },
+            MinConfidence: Number(process.env.AWS_REKOGNITION_MIN_CONFIDENCE || 75)
+          }));
+          if (!scan.JobId) throw new Error('REKOGNITION_JOB_ID_MISSING');
+          moderationJobId = scan.JobId;
+          await redis.set(`media_moderation:${moderationJobId}`, JSON.stringify({ userId: user.id, mediaUrl, moderationS3Key }), 'EX', 24 * 60 * 60);
+        } catch (error) {
+          await moderationS3.send(new DeleteObjectCommand({ Bucket: process.env.AWS_S3_BUCKET, Key: moderationS3Key })).catch(() => {});
+          console.error('AWS media moderation could not start:', error.message);
+          return json(response, 503, { error: 'MEDIA_MODERATION_UNAVAILABLE' });
+        }
       }
+      const uploadResult = { key, mediaUrl, moderationJobId, scanMode: moderationJobId ? 'automatic' : 'manual_review' };
+      await redis.set(uploadCacheKey, JSON.stringify(uploadResult), 'EX', 24 * 60 * 60);
+      return json(response, 201, uploadResult);
+    } finally {
+      activeMediaUploads -= 1;
     }
-    return json(response, 201, { key, mediaUrl, moderationJobId, scanMode: moderationJobId ? 'automatic' : 'manual_review' });
   }
 
   if (request.method === 'GET' && url.pathname.startsWith('/api/media/')) {
@@ -745,7 +821,7 @@ async function handle(request, response) {
       const user = await authenticatedUser(request);
       if (!user || (user.id !== post.authorId && user.role !== 'owner' && user.role !== 'moderator')) return json(response, 404, { error: 'MEDIA_NOT_FOUND' });
     }
-    const object = await s3.send(new GetObjectCommand({ Bucket: process.env.MINIO_BUCKET || 'nexa-media', Key: key }));
+    const object = await s3.send(new GetObjectCommand({ Bucket: mediaBucket, Key: key }));
     response.writeHead(200, { 'Content-Type': object.ContentType || 'application/octet-stream', 'Cache-Control': 'public, max-age=31536000, immutable' });
     object.Body.pipe(response);
     return;
@@ -787,8 +863,8 @@ async function handle(request, response) {
     const email = parsed.data.email.toLowerCase();
     if (await prisma.user.findUnique({ where: { email } })) return json(response, 409, { error: 'EMAIL_IN_USE' });
     const accountOrder = await prisma.user.count();
-    const usernameBase = email.split('@')[0].replace(/[^A-Za-z0-9_]/g, '_').slice(0, 18) || `user_${accountOrder}`;
-    const user = await prisma.user.create({ data: { email, displayName: usernameBase, username: `${usernameBase}_${accountOrder}`, verification: 'standard', identities: { create: { provider: 'email', providerSubject: email, passwordHash: await bcrypt.hash(parsed.data.password, 12) } } } });
+    const usernameBase = usernamePrefix(email.split('@')[0]);
+    const user = await prisma.user.create({ data: { email, displayName: usernameBase, username: generatedUsername(usernameBase, accountOrder.toString(36)), verification: 'standard', identities: { create: { provider: 'email', providerSubject: email, passwordHash: await bcrypt.hash(parsed.data.password, 12) } } } });
     const token = await createEmailToken(user.id, 'verify', 24 * 60);
     await sendSecurityMail({ to: email, subject: 'فعّل حساب NEXA PRIME', title: 'تأكيد البريد الإلكتروني', text: 'اضغط الرابط لتفعيل حسابك.', link: `${appOrigin}/auth/verify-email?token=${encodeURIComponent(token)}` });
     return json(response, 201, { user: publicUser(user), message: 'VERIFICATION_EMAIL_SENT' });
@@ -880,15 +956,14 @@ async function handle(request, response) {
     const profile = await profileResponse.json();
     const email = String(profile.email || '').trim().toLowerCase();
     if (!email) return json(response, 400, { error: 'GOOGLE_EMAIL_MISSING' });
+    if (profile.email_verified !== true) return json(response, 403, { error: 'GOOGLE_EMAIL_NOT_VERIFIED' });
     const providerSubject = String(profile.sub);
-    let user = await prisma.user.findUnique({ where: { email } }) || await prisma.user.findFirst({ where: { authIdentities: { some: { provider: 'google', providerSubject } } } });
+    let user = await prisma.user.findUnique({ where: { email } }) || await prisma.user.findFirst({ where: { identities: { some: { provider: 'google', providerSubject } } } });
     const firstUser = await prisma.user.count();
     if (!user) {
       const displayName = String(profile.name || email.split('@')[0] || 'NEXA User').slice(0, 30);
-      const baseUsername = (String(profile.name || email.split('@')[0] || 'user').replace(/[^A-Za-z0-9_]/g, '_') || `user_${firstUser + 1}`).slice(0, 18);
-      const nextIndex = (firstUser + 1).toString(36);
-      const username = `${baseUsername}_${nextIndex}`;
-      user = await prisma.user.create({ data: { email, displayName, username, avatarUrl: profile.picture || null, role: firstUser === 0 ? 'owner' : 'user', verification: firstUser === 0 ? 'gold' : firstUser <= 2 ? 'yellow' : 'standard', emailVerified: true } });
+      const username = generatedUsername(profile.name || email.split('@')[0], (firstUser + 1).toString(36));
+      user = await prisma.user.create({ data: { email, displayName, username, avatarUrl: profile.picture || null, role: 'user', verification: 'standard', emailVerified: true, status: 'needs_profile_setup' } });
     }
     const existingIdentity = await prisma.authIdentity.findUnique({ where: { provider_providerSubject: { provider: 'google', providerSubject } } });
     if (!existingIdentity || existingIdentity.userId !== user.id) {
@@ -896,14 +971,14 @@ async function handle(request, response) {
     }
     if (!user.displayName || !user.username || !user.avatarUrl) {
       const baseName = String(profile.name || user.displayName || email.split('@')[0] || 'NEXA User').replace(/[^\p{L}\p{N}_\s]/gu, ' ').trim().slice(0, 30) || 'NEXA User';
-      const usernameBase = String(user.username || (email.split('@')[0].replace(/[^A-Za-z0-9_]/g, '_') || 'user')).slice(0, 18);
-      const nextUsername = user.username || `${usernameBase}_${(user.id || '').slice(-4) || Math.random().toString(36).slice(2, 6)}`;
+      const nextUsername = user.username || generatedUsername(email.split('@')[0], (user.id || '').slice(-4) || randomBytes(2).toString('hex'));
       user = await prisma.user.update({ where: { id: user.id }, data: { displayName: baseName, username: nextUsername.slice(0, 20), avatarUrl: user.avatarUrl || profile.picture || null, emailVerified: true } });
     }
-    const sessionPayload = buildSessionUser({ ...user, status: 'needs_profile_setup', emailVerified: true });
+    const needsProfileSetup = user.status === 'needs_profile_setup' || !user.displayName || !user.username;
+    const sessionPayload = buildSessionUser({ ...user, status: needsProfileSetup ? 'needs_profile_setup' : 'active', emailVerified: true });
     await setSession(response, sessionPayload);
     const frontendBase = process.env.APP_ORIGIN || process.env.FRONTEND_ORIGIN || appOrigin;
-    response.writeHead(302, { Location: `${frontendBase.replace(/\/$/, '')}/setup-profile` });
+    response.writeHead(302, { Location: `${frontendBase.replace(/\/$/, '')}${needsProfileSetup ? '/setup-profile' : '/home'}` });
     return response.end();
   }
 
@@ -950,7 +1025,19 @@ async function handle(request, response) {
         const stat = await fs.stat(filePath);
         if (stat.isFile()) {
           const ext = path.extname(filePath).toLowerCase();
-          const mimeType = ext === '.html' ? 'text/html; charset=utf-8' : ext === '.js' ? 'application/javascript; charset=utf-8' : ext === '.css' ? 'text/css; charset=utf-8' : ext === '.svg' ? 'image/svg+xml' : 'application/octet-stream';
+          const mimeTypes = {
+            '.css': 'text/css; charset=utf-8',
+            '.html': 'text/html; charset=utf-8',
+            '.ico': 'image/x-icon',
+            '.js': 'application/javascript; charset=utf-8',
+            '.json': 'application/json; charset=utf-8',
+            '.png': 'image/png',
+            '.svg': 'image/svg+xml',
+            '.webmanifest': 'application/manifest+json; charset=utf-8',
+            '.webp': 'image/webp',
+            '.woff2': 'font/woff2'
+          };
+          const mimeType = mimeTypes[ext] || 'application/octet-stream';
           response.writeHead(200, { 'Content-Type': mimeType, 'Cache-Control': 'public, max-age=3600' });
           return response.end(await fs.readFile(filePath));
         }
@@ -1030,10 +1117,15 @@ connectServices().then(() => {
   processPendingMediaModeration().catch(error => console.error('AWS moderation worker failed:', error.message));
   const moderationTimer = setInterval(() => processPendingMediaModeration().catch(error => console.error('AWS moderation worker failed:', error.message)), 15000);
   moderationTimer.unref();
-  server.listen(port, '0.0.0.0', () => console.log(`NEXA API listening on http://localhost:${port}`));
-}).catch(error => {
+  server.listen(port, process.env.HOST || '0.0.0.0', () => console.log(`NEXA API listening on http://localhost:${port}`));
+}).catch(async error => {
   console.error('NEXA API started in degraded mode because PostgreSQL, Redis, or MinIO is unavailable.', error.message);
   servicesReady = false;
-  server.listen(port, '0.0.0.0', () => console.log(`NEXA API listening in degraded mode on http://localhost:${port}`));
+  if (process.env.NODE_ENV === 'production') {
+    await disconnectServices();
+    process.exitCode = 1;
+    return;
+  }
+  server.listen(port, process.env.HOST || '0.0.0.0', () => console.log(`NEXA API listening in degraded mode on http://localhost:${port}`));
 });
 process.on('SIGTERM', async () => { await disconnectServices(); server.close(); });
