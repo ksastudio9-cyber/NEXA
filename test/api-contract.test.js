@@ -15,6 +15,19 @@ test('social API exposes persistent content operations', () => {
   assert.match(server, /like\|save/);
 });
 
+test('channel membership is persistent and protects channel message access', () => {
+  assert.match(schema, /model ChannelMember[\s\S]*?@@map\("channel_members"\)/);
+  assert.match(server, /channelMembershipRoute = url\.pathname\.match/);
+  assert.match(server, /channelMember\.upsert/);
+  assert.match(server, /CHANNEL_MEMBERSHIP_REQUIRED/);
+  assert.match(server, /channel\.members\?\.length/);
+  const app = fs.readFileSync(new URL('../src/main.js', import.meta.url), 'utf8');
+  assert.match(app, /data-enter-channel/);
+  assert.match(app, /data-channel-composer/);
+  assert.match(app, /channelId: state\.activeChannelId/);
+  assert.match(app, /'channel-chat': channelChatView/);
+});
+
 test('authenticated users can discover chat recipients with public profile fields only', () => {
   assert.match(server, /url\.pathname === '\/api\/users'[\s\S]*?authenticatedUser\(request\)/);
   assert.match(server, /select: \{ id: true, username: true, displayName: true, avatarUrl: true, verification: true \}/);
@@ -34,10 +47,13 @@ test('developer access is checked by the server owner role', () => {
   assert.doesNotMatch(server, /localStorage/);
 });
 
-test('owner bootstrap requires the configured verified email and Google-verified email', () => {
-  assert.match(server, /OWNER_EMAIL/);
-  assert.match(server, /OWNER_BOOTSTRAP_NOT_ALLOWED/);
-  assert.match(server, /profile\.email_verified !== true/);
+test('the first verified the_x username can claim owner privileges only once', () => {
+  assert.match(server, /username\?\.toLowerCase\(\) !== 'the_x'/);
+  assert.match(server, /wantsOwner/);
+  assert.match(server, /user\.emailVerified !== true/);
+  assert.match(server, /redis\.set\(INITIAL_OWNER_CLAIM_KEY, user\.id, 'EX', 300, 'NX'\)/);
+  assert.match(server, /OWNER_ALREADY_ASSIGNED/);
+  assert.doesNotMatch(server, /OWNER_BOOTSTRAP_NOT_ALLOWED/);
   assert.doesNotMatch(server, /role:\s*firstUser\s*===\s*0\s*\?\s*'owner'/);
 });
 
@@ -78,7 +94,7 @@ test('Google profile setup hydrates its pending user and persists completed stat
   const app = fs.readFileSync(new URL('../src/main.js', import.meta.url), 'utf8');
   assert.match(app, /state\.pendingUser = needsProfileSetup \? state\.activeUser : null/);
   assert.match(app, /state\.authScreen = needsProfileSetup \? 'forced-profile' : 'guest'/);
-  assert.match(server, /data: \{ \.\.\.parsed\.data, status: 'active' \}/);
+  assert.match(server, /saveAccountProfile\(user, \{ \.\.\.parsed\.data, status: 'active' \}\)/);
   assert.match(server, /JSON\.stringify\(buildSessionUser\(updated\)\)/);
   assert.match(server, /needsProfileSetup \? '\/setup-profile' : '\/home'/);
   const saveProfile = app.match(/async function saveProfileForm\(form\) \{[\s\S]*?\n\}/)?.[0] || '';
@@ -87,6 +103,23 @@ test('Google profile setup hydrates its pending user and persists completed stat
   assert.doesNotMatch(saveProfile, /authScreen = 'device'/);
   assert.match(saveProfile, /authErrorMessage\(error\)/);
   assert.match(server, /error\.code === 'P2002'[\s\S]*?USERNAME_IN_USE/);
+});
+
+test('Google and email signup persist addresses and require profile completion', () => {
+  assert.match(server, /const email = String\(profile\.email \|\| ''\)\.trim\(\)\.toLowerCase\(\)/);
+  assert.match(server, /emailVerified: true, status: 'needs_profile_setup'/);
+  assert.match(server, /provider: 'google', providerSubject/);
+  assert.match(server, /email, displayName: usernameBase, username: generatedUsername[\s\S]*?status: 'needs_profile_setup'/);
+  assert.match(server, /status: 'needs_profile_setup'[\s\S]*?identities: \{ create: \{ provider: 'email'/);
+  assert.match(server, /profile\.email_verified !== true/);
+});
+
+test('new direct messages trigger email notifications without exposing message text', () => {
+  assert.match(server, /async function pushNotification[\s\S]*?recipient\?\.notificationsEnabled && recipient\.emailVerified === true/);
+  assert.match(server, /sendAccountNotification\(\{ to: recipient\.email, subject: 'إشعار جديد من NEXA', text: body \}\)/);
+  assert.match(server, /pushNotification\(recipientId, 'message', \{ actorId: user\.id, actorName: user\.username \|\| user\.displayName, message: `أرسل لك @\$\{user\.username \|\| user\.displayName\} رسالة جديدة\. افتح NEXA لقراءتها\.` \}\)/);
+  const mailer = fs.readFileSync(new URL('../server/mailer.js', import.meta.url), 'utf8');
+  assert.match(mailer, /Boolean\(process\.env\.SMTP_HOST && process\.env\.SMTP_USER && process\.env\.SMTP_PASS\)/);
 });
 
 test('username rules are shared by the browser and API', () => {
@@ -117,14 +150,36 @@ test('moderation and report workflows exist for owner and moderator controls', (
 
 test('text moderation runs before user-generated content is stored', () => {
   for (const route of [
-    /request\.method === 'POST' && url\.pathname === '\/api\/posts'[\s\S]*?contentCheck\(text\)[\s\S]*?prisma\.post\.create/,
-    /postRoute[\s\S]*?contentCheck\(text\)[\s\S]*?prisma\.post\.update/,
-    /request\.method === 'POST' && commentsRoute[\s\S]*?contentCheck\(text\)[\s\S]*?prisma\.comment\.create/,
-    /request\.method === 'POST' && url\.pathname === '\/api\/messages'[\s\S]*?contentCheck\(text\)[\s\S]*?prisma\.message\.create/,
-    /request\.method === 'PATCH' && url\.pathname === '\/api\/me'[\s\S]*?contentCheck\([\s\S]*?prisma\.user\.update/,
-    /request\.method === 'POST' && url\.pathname === '\/api\/channels'[\s\S]*?contentCheck\([\s\S]*?prisma\.channel\.create/,
-    /channelRoute[\s\S]*?contentCheck\([\s\S]*?prisma\.channel\.update/
+    /request\.method === 'POST' && url\.pathname === '\/api\/posts'[\s\S]*?submittedContentCheck\([\s\S]*?prisma\.post\.create/,
+    /postRoute[\s\S]*?submittedContentCheck\(text\)[\s\S]*?prisma\.post\.update/,
+    /request\.method === 'POST' && commentsRoute[\s\S]*?submittedContentCheck\(text\)[\s\S]*?prisma\.comment\.create/,
+    /request\.method === 'POST' && url\.pathname === '\/api\/messages'[\s\S]*?submittedContentCheck\(text\)[\s\S]*?prisma\.message\.create/,
+    /request\.method === 'PATCH' && url\.pathname === '\/api\/me'[\s\S]*?submittedContentCheck\([\s\S]*?prisma\.user\.update/,
+    /request\.method === 'POST' && url\.pathname === '\/api\/channels'[\s\S]*?submittedContentCheck\([\s\S]*?transaction\.channel\.create/,
+    /channelRoute[\s\S]*?submittedContentCheck\([\s\S]*?prisma\.channel\.update/
   ]) assert.match(server, route);
+});
+
+test('DeepSeek moderation runs server-side before storing text and caches low-cost decisions', () => {
+  const moderation = fs.readFileSync(new URL('../server/deepseek-moderation.js', import.meta.url), 'utf8');
+  assert.match(server, /inspectTextWithDeepSeek\(aiText, \{ cache: redis \}\)/);
+  assert.match(server, /DEEPSEEK_NOT_CONFIGURED/);
+  assert.match(server, /AI_MODERATION_UNAVAILABLE/);
+  assert.match(moderation, /https:\/\/api\.deepseek\.com\/chat\/completions/);
+  assert.match(moderation, /max_tokens: 80/);
+  assert.match(moderation, /CACHE_TTL_SECONDS = 24 \* 60 \* 60/);
+  assert.match(moderation, /defamation[\s\S]*incitement[\s\S]*sexual_content/);
+});
+
+test('owner link policies are server-authorized and applied to submitted text', () => {
+  assert.match(server, /url\.pathname === '\/api\/owner\/links'[\s\S]*?user\.role !== 'owner'/);
+  assert.match(server, /ownerLinkRoute[\s\S]*?user\.role !== 'owner'[\s\S]*?redis\.srem/);
+  assert.match(server, /redis\.sadd\(LINK_ALLOWLIST_KEY/);
+  assert.match(server, /linkCheck\(value, allowedHosts\)/);
+  assert.match(server, /action: 'link_blocked'/);
+  const app = fs.readFileSync(new URL('../src/main.js', import.meta.url), 'utf8');
+  assert.match(app, /api\('\/api\/owner\/links'\)/);
+  assert.match(app, /data-remove-link-host/);
 });
 
 test('new posts stay hidden from public feeds until moderator approval', () => {
@@ -168,6 +223,14 @@ test('service worker never caches authenticated API or auth responses', () => {
   assert.match(serviceWorker, /pathname\.startsWith\('\/api\/'\)/);
   assert.match(serviceWorker, /pathname\.startsWith\('\/auth\/'\)/);
   assert.match(serviceWorker, /if \(pathname === '\/api'[\s\S]*?return;/);
+});
+
+test('Codespaces previews unregister stale service workers and bypass cache-first app assets', () => {
+  const app = fs.readFileSync(new URL('../src/main.js', import.meta.url), 'utf8');
+  assert.match(serviceWorker, /isCodespacesPreview = \/\^\[a-z0-9-\]\+\-5173\\\.app\\\.github\\\.dev\$\/i/);
+  assert.match(serviceWorker, /self\.registration\.unregister\(\)/);
+  assert.match(serviceWorker, /event\.respondWith\(fetch\(event\.request\)\)/);
+  assert.match(app, /if \(import\.meta\.env\.DEV\)[\s\S]*?registration\.unregister\(\)/);
 });
 
 test('offline outbox persists messages and media and uses stable retry identifiers', () => {
@@ -257,12 +320,26 @@ test('the app has one public origin and keeps the development backend private', 
   const envExample = fs.readFileSync(new URL('../.env.example', import.meta.url), 'utf8');
   assert.match(vite, /port:\s*5173/);
   assert.match(vite, /http:\/\/127\.0\.0\.1:4001/);
+  assert.match(vite, /proxy\.on\('proxyReq',[\s\S]*?removeHeader\('origin'\)/);
   assert.match(packageJson.scripts['dev:all'], /npm run server.*npm run dev/);
   assert.match(packageJson.scripts.server, /HOST=127\.0\.0\.1 PORT=4001/);
   assert.match(envExample, /APP_ORIGIN=http:\/\/localhost:5173/);
-  assert.match(envExample, /GOOGLE_REDIRECT_URI=http:\/\/localhost:5173\/auth\/google\/callback/);
+  assert.match(envExample, /GOOGLE_REDIRECT_URI=/);
+  assert.match(server, /function googleRedirectUri\(\)/);
+  assert.match(server, /const codespaceOrigin = \/\^\[a-z0-9-\]\+\$\/i\.test\(codespaceName\)/);
+  assert.match(server, /const appOrigin = codespaceOrigin \|\| process\.env\.APP_ORIGIN/);
+  assert.match(server, /if \(origin === appOrigin \|\| origin === codespaceOrigin\) return true/);
+  assert.match(server, /const codespaceRedirectUri = codespaceOrigin\s*\?/);
+  assert.match(server, /codespaceRedirectUri \|\| process\.env\.GOOGLE_REDIRECT_URI/);
+  assert.match(server, /\/auth\/google\/callback`/);
   assert.match(server, /'http:\/\/localhost:5173'/);
   assert.doesNotMatch(server, /localhost:4000/);
+});
+
+test('the development proxy removes forwarded Origin while state-changing APIs retain CSRF validation', () => {
+  const vite = fs.readFileSync(new URL('../vite.config.js', import.meta.url), 'utf8');
+  assert.match(vite, /proxyRequest\.removeHeader\('origin'\)/);
+  assert.match(server, /CSRF_INVALID/);
 });
 
 test('development accepts only HTTPS Codespaces origins forwarding port 5173', () => {
@@ -275,15 +352,21 @@ test('development accepts only HTTPS Codespaces origins forwarding port 5173', (
 test('compose requires secrets, gates startup on healthy services, and keeps data ports private', () => {
   const compose = fs.readFileSync(new URL('../docker-compose.yml', import.meta.url), 'utf8');
   assert.match(compose, /PORT: 5173/);
+  assert.match(compose, /CODESPACE_NAME: \$\{CODESPACE_NAME:-\}/);
   assert.match(compose, /"5173:5173"/);
   assert.match(compose, /127\.0\.0\.1:5173\/api\/health/);
   assert.match(compose, /POSTGRES_PASSWORD:\s*\$\{POSTGRES_PASSWORD:\?/);
   assert.match(compose, /SESSION_SECRET:\s*\$\{SESSION_SECRET:\?/);
-  assert.match(compose, /OWNER_EMAIL:\s*\$\{OWNER_EMAIL:\?/);
+  assert.doesNotMatch(compose, /OWNER_EMAIL/);
+  assert.match(compose, /SMTP_USER: \$\{SMTP_USER:-\}/);
+  assert.match(compose, /SMTP_PASS: \$\{SMTP_PASS:-\}/);
   assert.match(compose, /MINIO_SECRET_KEY: \$\{MINIO_SECRET_KEY:-local-storage-dev-only\}/);
   assert.match(compose, /profiles: \[local-storage\]/);
   assert.match(compose, /condition: service_healthy/);
-  assert.match(compose, /internal: true/);
+  assert.match(compose, /internal: \$\{BACKEND_NETWORK_INTERNAL:-true\}/);
+  assert.match(fs.readFileSync(new URL('../.env.example', import.meta.url), 'utf8'), /BACKEND_NETWORK_INTERNAL=true/);
+  assert.match(compose, /127\.0\.0\.1:5432:5432/);
+  assert.match(compose, /127\.0\.0\.1:6379:6379/);
   assert.match(compose, /127\.0\.0\.1:9000:9000/);
   assert.doesNotMatch(compose, /"(?:5432|6379|9000|9001):/);
   assert.doesNotMatch(compose, /change-me(?:-now)?/);
@@ -326,4 +409,28 @@ test('Google login uses a backend-generated state and redirects to the profile s
   assert.match(server, /Set-Cookie[\s\S]*nexa_oauth_session/i);
   assert.match(server, /identities: \{ some: \{ provider: 'google'/);
   assert.doesNotMatch(server, /authIdentities/);
+});
+
+test('Google and email verification return to the app with actionable status', () => {
+  assert.match(server, /GOOGLE_OAUTH_NOT_CONFIGURED/);
+  assert.match(server, /AUTH_SERVICES_UNAVAILABLE/);
+  assert.match(server, /EMAIL_VERIFICATION_INVALID/);
+  assert.match(server, /email_verified=1/);
+  const app = fs.readFileSync(new URL('../src/main.js', import.meta.url), 'utf8');
+  assert.match(app, /GOOGLE_OAUTH_NOT_CONFIGURED:/);
+  assert.match(app, /EMAIL_VERIFICATION_INVALID:/);
+  assert.match(app, /email_verified.*=== '1'/);
+});
+
+test('account setup does not expose the stale origin error text', () => {
+  const app = fs.readFileSync(new URL('../src/main.js', import.meta.url), 'utf8');
+  assert.doesNotMatch(app, /رابط الموقع غير معتمد للخادم/);
+  assert.match(app, /ORIGIN_NOT_ALLOWED: 'تعذر إكمال الطلب\. حدّث الصفحة وحاول مجددًا\.'/);
+});
+
+test('OAuth and email verification redirects bypass browser Origin checks but still validate one-time tokens', () => {
+  assert.match(server, /isTrustedRedirect = request\.method === 'GET' && \['\/auth\/google\/callback', '\/auth\/verify-email'\]\.includes\(url\.pathname\)/);
+  assert.match(server, /if \(!isTrustedRedirect && !allowedOrigin\(request\.headers\.origin\)\)/);
+  assert.match(server, /receivedState !== storedState/);
+  assert.match(server, /tokenHash: hashToken\(token\), type: 'verify'/);
 });

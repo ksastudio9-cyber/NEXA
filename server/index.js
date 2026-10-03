@@ -8,13 +8,16 @@ import { z } from 'zod';
 import { WebSocketServer } from 'ws';
 import { StartContentModerationCommand } from '@aws-sdk/client-rekognition';
 import { connectServices, disconnectServices, prisma, redis, s3, moderationS3, rekognition, DeleteObjectCommand, GetObjectCommand, PutObjectCommand } from './services.js';
-import { sendSecurityMail, smtpEnabled } from './mailer.js';
-import { contentCheck } from './moderation.js';
+import { sendAccountNotification, sendSecurityMail, smtpEnabled } from './mailer.js';
+import { contentCheck, linkCheck, normalizeAllowedHost } from './moderation.js';
 import { inspectVideoModeration } from './media-moderation.js';
+import { inspectTextWithDeepSeek } from './deepseek-moderation.js';
 import { USERNAME_PATTERN } from '../shared/validation.js';
 
 const port = Number(process.env.PORT || 4000);
-const appOrigin = process.env.APP_ORIGIN || process.env.FRONTEND_ORIGIN || 'http://localhost:5173';
+const codespaceName = process.env.CODESPACE_NAME || '';
+const codespaceOrigin = /^[a-z0-9-]+$/i.test(codespaceName) ? `https://${codespaceName}-5173.app.github.dev` : null;
+const appOrigin = codespaceOrigin || process.env.APP_ORIGIN || process.env.FRONTEND_ORIGIN || 'http://localhost:5173';
 const mediaBucket = process.env.S3_BUCKET || process.env.MINIO_BUCKET || 'nexa-media';
 const sessionSecret = process.env.SESSION_SECRET;
 const jwtSecret = process.env.JWT_SECRET || sessionSecret;
@@ -25,6 +28,8 @@ let errorCount = 0;
 const MAX_MEDIA_UPLOAD_BYTES = 100 * 1024 * 1024;
 const MAX_CONCURRENT_MEDIA_UPLOADS = 2;
 let activeMediaUploads = 0;
+const LINK_ALLOWLIST_KEY = 'nexa:links:allowlist';
+const INITIAL_OWNER_CLAIM_KEY = 'nexa:developer:first-owner';
 
 function json(response, status, body) {
   response.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', 'Access-Control-Allow-Origin': appOrigin, 'Access-Control-Allow-Credentials': 'true' });
@@ -50,7 +55,7 @@ function isCodespacesOrigin(origin) {
 
 function allowedOrigin(origin) {
   if (!origin) return true;
-  if (origin === appOrigin) return true;
+  if (origin === appOrigin || origin === codespaceOrigin) return true;
   return process.env.NODE_ENV !== 'production' && (origin === 'http://localhost:5173' || isCodespacesOrigin(origin));
 }
 
@@ -121,7 +126,7 @@ function buildSessionUser(user) {
     status: user.status || 'active',
     role: derivedRole,
     tier: user.verification === 'gold' ? 'gold' : user.verification === 'yellow' ? 'yellow' : 'normal',
-    profileSetup: Boolean(user.displayName && user.username) && user.emailVerified !== false,
+    profileSetup: user.status !== 'needs_profile_setup' && Boolean(user.displayName && user.username) && user.emailVerified !== false,
     provider: user.identities?.[0]?.provider || 'local'
   };
 }
@@ -210,6 +215,58 @@ function publicProfile(user) {
   return safeUser;
 }
 
+async function submittedContentCheck(value, aiText = value) {
+  const termError = contentCheck(value);
+  if (termError) return termError;
+  const allowedHosts = await redis.smembers(LINK_ALLOWLIST_KEY);
+  const linkError = linkCheck(value, allowedHosts);
+  if (linkError) {
+    await prisma.moderationLog.create({ data: { targetType: 'link', action: 'link_blocked', reason: 'external_link_not_allowlisted' } });
+    return linkError;
+  }
+  if (!process.env.DEEPSEEK_API_KEY && process.env.NODE_ENV !== 'production') return null;
+  try {
+    const result = await inspectTextWithDeepSeek(aiText, { cache: redis });
+    return result.decision === 'reject' ? 'CONTENT_REJECTED' : result.decision === 'review' ? 'CONTENT_REQUIRES_REVIEW' : null;
+  } catch (error) {
+    console.error('DeepSeek text moderation failed:', error.code || error.message);
+    return error.code || 'AI_MODERATION_UNAVAILABLE';
+  }
+}
+
+function rejectSubmittedContent(response, error) {
+  const status = ['DEEPSEEK_NOT_CONFIGURED', 'AI_MODERATION_UNAVAILABLE'].includes(error) ? 503 : 422;
+  return json(response, status, { error });
+}
+
+async function saveAccountProfile(user, profileData) {
+  const wantsOwner = profileData.username.toLowerCase() === 'the_x';
+  if (user.role === 'owner' && !wantsOwner) throw Object.assign(new Error('OWNER_USERNAME_RESERVED'), { code: 'OWNER_USERNAME_RESERVED' });
+
+  let ownerClaimAcquired = false;
+  const data = { ...profileData };
+  if (wantsOwner) {
+    if (user.emailVerified !== true) throw Object.assign(new Error('OWNER_EMAIL_NOT_VERIFIED'), { code: 'OWNER_EMAIL_NOT_VERIFIED' });
+    const existingOwner = await prisma.user.findFirst({ where: { role: 'owner' }, select: { id: true } });
+    if (existingOwner && existingOwner.id !== user.id) throw Object.assign(new Error('OWNER_ALREADY_ASSIGNED'), { code: 'OWNER_ALREADY_ASSIGNED' });
+    if (!existingOwner) {
+      const claim = await redis.set(INITIAL_OWNER_CLAIM_KEY, user.id, 'EX', 300, 'NX');
+      if (claim === 'OK') ownerClaimAcquired = true;
+      else if (await redis.get(INITIAL_OWNER_CLAIM_KEY) !== user.id) throw Object.assign(new Error('OWNER_ALREADY_ASSIGNED'), { code: 'OWNER_ALREADY_ASSIGNED' });
+    }
+    Object.assign(data, { username: 'the_x', role: 'owner', verification: 'gold', tier: 'gold' });
+  }
+
+  try {
+    const updated = await prisma.user.update({ where: { id: user.id }, data });
+    if (ownerClaimAcquired) await redis.persist(INITIAL_OWNER_CLAIM_KEY).catch(() => {});
+    return updated;
+  } catch (error) {
+    if (ownerClaimAcquired) await redis.eval("if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end", 1, INITIAL_OWNER_CLAIM_KEY, user.id).catch(() => {});
+    throw error;
+  }
+}
+
 async function recordLogin(userId, request, success) {
   if (!userId || !servicesReady) return;
   await prisma.loginHistory.create({ data: {
@@ -255,6 +312,11 @@ async function pushNotification(userId, type, payload = {}) {
   if (!userId) return null;
   const notification = await prisma.notification.create({ data: { userId, type, payload } });
   broadcastEvent(userId, { type: 'notification', notification });
+  const recipient = await prisma.user.findUnique({ where: { id: userId }, select: { email: true, username: true, notificationsEnabled: true, emailVerified: true } });
+  if (recipient?.notificationsEnabled && recipient.emailVerified === true) {
+    const body = typeof payload.message === 'string' ? payload.message : 'لديك إشعار جديد في NEXA.';
+    sendAccountNotification({ to: recipient.email, subject: 'إشعار جديد من NEXA', text: body }).catch(error => console.error('Account notification email failed:', error.message));
+  }
   return notification;
 }
 
@@ -287,7 +349,21 @@ function parseMultipart(contentType, buffer) {
 }
 
 function oauthEnabled() {
-  return Boolean(process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET && process.env.GOOGLE_REDIRECT_URI);
+  return Boolean(process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET && googleRedirectUri());
+}
+
+function googleRedirectUri() {
+  const codespaceRedirectUri = codespaceOrigin
+    ? `${appOrigin.replace(/\/$/u, '')}/auth/google/callback`
+    : null;
+  return codespaceRedirectUri || process.env.GOOGLE_REDIRECT_URI || `${appOrigin.replace(/\/$/u, '')}/auth/google/callback`;
+}
+
+function oauthErrorRedirect(response, error) {
+  const origin = appOrigin.replace(/\/$/u, '');
+  response.setHeader('Set-Cookie', cookieString('nexa_oauth_session', '', { maxAge: 0, secure: usesSecureCookies(), sameSite: usesSecureCookies() ? 'None' : 'Lax', path: '/' }));
+  response.writeHead(302, { Location: `${origin}/?auth_error=${encodeURIComponent(error)}` });
+  return response.end();
 }
 
 function mediaModerationEnabled() {
@@ -324,7 +400,8 @@ async function handle(request, response) {
   const url = new URL(request.url, `http://${request.headers.host}`);
   securityHeaders(response);
 
-  if (!allowedOrigin(request.headers.origin)) return json(response, 403, { error: 'ORIGIN_NOT_ALLOWED' });
+  const isTrustedRedirect = request.method === 'GET' && ['/auth/google/callback', '/auth/verify-email'].includes(url.pathname);
+  if (!isTrustedRedirect && !allowedOrigin(request.headers.origin)) return json(response, 403, { error: 'ORIGIN_NOT_ALLOWED' });
   const rateLimitResult = url.pathname === '/api/health' ? true : await rateLimit(request, url.pathname);
   if (rateLimitResult === null) return json(response, 503, { error: 'RATE_LIMIT_UNAVAILABLE' });
   if (!rateLimitResult) return json(response, 429, { error: 'RATE_LIMITED' });
@@ -347,7 +424,7 @@ async function handle(request, response) {
   }
 
   if (request.method === 'GET' && url.pathname === '/api/health') {
-    return json(response, servicesReady ? 200 : 503, { ok: servicesReady, service: 'nexa-api', oauth: oauthEnabled(), appOrigin, redirectUri: process.env.GOOGLE_REDIRECT_URI || null, storage: servicesReady ? 'postgres-redis-minio' : 'offline', uptimeSeconds: Math.floor((Date.now() - startedAt) / 1000), requestCount, errorCount, mode: servicesReady ? 'live' : 'degraded' });
+    return json(response, servicesReady ? 200 : 503, { ok: servicesReady, service: 'nexa-api', oauth: oauthEnabled(), appOrigin, redirectUri: oauthEnabled() ? googleRedirectUri() : null, storage: servicesReady ? 'postgres-redis-minio' : 'offline', uptimeSeconds: Math.floor((Date.now() - startedAt) / 1000), requestCount, errorCount, mode: servicesReady ? 'live' : 'degraded' });
   }
 
   if (!servicesReady && url.pathname.startsWith('/api/') && url.pathname !== '/api/health' && url.pathname !== '/api/csrf') {
@@ -369,17 +446,14 @@ async function handle(request, response) {
     const user = await authenticatedUser(request);
     if (!user) return json(response, 401, { error: 'AUTH_REQUIRED' });
     if (user.role === 'owner') return json(response, 200, { owner: true, claimed: false });
-    const bootstrapOwnerEmail = String(process.env.OWNER_EMAIL || '').trim().toLowerCase();
-    if (!bootstrapOwnerEmail || user.email?.toLowerCase() !== bootstrapOwnerEmail || user.emailVerified !== true) return json(response, 403, { error: 'OWNER_BOOTSTRAP_NOT_ALLOWED' });
-    const claim = await redis.set('nexa:developer:first-owner', user.id, 'NX');
-    if (claim !== 'OK') return json(response, 403, { error: 'DEVELOPER_AREA_LOCKED' });
-    const owner = await prisma.user.findFirst({ where: { role: 'owner' }, select: { id: true } });
-    if (owner && owner.id !== user.id) {
-      await redis.del('nexa:developer:first-owner');
-      return json(response, 403, { error: 'DEVELOPER_AREA_LOCKED' });
+    if (user.username?.toLowerCase() !== 'the_x') return json(response, 403, { error: 'OWNER_USERNAME_REQUIRED' });
+    try {
+      const updated = await saveAccountProfile(user, { displayName: user.displayName, username: user.username, status: 'active' });
+      return json(response, 200, { owner: true, claimed: true, user: publicUser(updated) });
+    } catch (error) {
+      if (['OWNER_EMAIL_NOT_VERIFIED', 'OWNER_ALREADY_ASSIGNED'].includes(error.code)) return json(response, 403, { error: error.code });
+      throw error;
     }
-    const updated = await prisma.user.update({ where: { id: user.id }, data: { role: 'owner', verification: 'gold', tier: 'gold' } });
-    return json(response, 200, { owner: true, claimed: true, user: publicUser(updated) });
   }
 
   if (request.method === 'PATCH' && url.pathname === '/api/me') {
@@ -396,14 +470,20 @@ async function handle(request, response) {
       website: z.string().url().max(2048).or(z.literal('')).optional()
     }).safeParse(body);
     if (!parsed.success) return json(response, 400, { error: 'INVALID_PROFILE' });
-    if (contentCheck(`${parsed.data.displayName} ${parsed.data.bio || ''}`)) return json(response, 422, { error: 'CONTENT_REJECTED' });
+    const profileError = await submittedContentCheck(
+      [parsed.data.displayName, parsed.data.bio, parsed.data.website, parsed.data.avatarUrl, parsed.data.bannerUrl].filter(Boolean).join(' '),
+      [parsed.data.displayName, parsed.data.bio].filter(Boolean).join(' ')
+    );
+    if (profileError) return rejectSubmittedContent(response, profileError);
     const duplicate = await prisma.user.findFirst({ where: { username: { equals: parsed.data.username, mode: 'insensitive' }, NOT: { id: user.id } } });
     if (duplicate) return json(response, 409, { error: 'USERNAME_IN_USE' });
     let updated;
     try {
-      updated = await prisma.user.update({ where: { id: user.id }, data: { ...parsed.data, status: 'active' } });
+      updated = await saveAccountProfile(user, { ...parsed.data, status: 'active' });
     } catch (error) {
       if (error.code === 'P2002') return json(response, 409, { error: 'USERNAME_IN_USE' });
+      if (['OWNER_USERNAME_RESERVED', 'OWNER_ALREADY_ASSIGNED'].includes(error.code)) return json(response, 409, { error: error.code });
+      if (error.code === 'OWNER_EMAIL_NOT_VERIFIED') return json(response, 403, { error: error.code });
       throw error;
     }
     const sessionToken = parseCookies(request).nexa_session || '';
@@ -489,7 +569,8 @@ async function handle(request, response) {
     const clientId = typeof body?.clientId === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(body.clientId) ? body.clientId : null;
     const visibility = ['public', 'followers', 'private'].includes(body?.visibility) ? body.visibility : 'public';
     if (!text && !mediaUrl) return json(response, 400, { error: 'POST_CONTENT_REQUIRED' });
-    if (contentCheck(text)) return json(response, 422, { error: 'CONTENT_REJECTED' });
+    const postError = await submittedContentCheck(text || '');
+    if (postError) return rejectSubmittedContent(response, postError);
     if (clientId) {
       const existingPost = await prisma.post.findUnique({ where: { id: clientId }, include: { author: { select: { id: true, username: true, displayName: true, avatarUrl: true, verification: true } }, _count: { select: { likes: true, comments: true } } } });
       if (existingPost) return existingPost.authorId === user.id ? json(response, 200, { post: publicPost(existingPost, user.id) }) : json(response, 409, { error: 'CLIENT_ID_IN_USE' });
@@ -542,7 +623,8 @@ async function handle(request, response) {
     const body = await readBody(request);
     const text = requireText(body?.body);
     if (!text) return json(response, 400, { error: 'POST_CONTENT_REQUIRED' });
-    if (contentCheck(text)) return json(response, 422, { error: 'CONTENT_REJECTED' });
+    const postError = await submittedContentCheck(text);
+    if (postError) return rejectSubmittedContent(response, postError);
     const updated = await prisma.post.update({ where: { id: postRoute[1] }, data: { body: text, moderationStatus: 'pending', moderationJobId: null } });
     return json(response, 200, { post: updated });
   }
@@ -558,7 +640,8 @@ async function handle(request, response) {
     const body = await readBody(request);
     const text = requireText(body?.body, 1000);
     if (!text) return json(response, 400, { error: 'COMMENT_REQUIRED' });
-    if (contentCheck(text)) return json(response, 422, { error: 'CONTENT_REJECTED' });
+    const commentError = await submittedContentCheck(text);
+    if (commentError) return rejectSubmittedContent(response, commentError);
     const comment = await prisma.comment.create({ data: { postId: commentsRoute[1], authorId: user.id, body: text }, include: { author: { select: { id: true, username: true, displayName: true, avatarUrl: true } } } });
     const post = await prisma.post.findUnique({ where: { id: commentsRoute[1] }, select: { authorId: true } });
     if (post && post.authorId !== user.id) await pushNotification(post.authorId, 'comment', { actorId: user.id, actorName: user.username || user.displayName, postId: commentsRoute[1], commentId: comment.id, message: `${user.username || user.displayName} علق على منشورك` });
@@ -699,8 +782,21 @@ async function handle(request, response) {
   }
 
   if (request.method === 'GET' && url.pathname === '/api/channels') {
-    const channels = await prisma.channel.findMany({ orderBy: { createdAt: 'desc' }, take: 50, include: { owner: { select: { id: true, username: true, displayName: true } }, _count: { select: { messages: true } } } });
-    return json(response, 200, { channels });
+    const user = await authenticatedUser(request);
+    const channels = await prisma.channel.findMany({
+      where: { OR: [{ visibility: 'public' }, ...(user ? [{ ownerId: user.id }, { members: { some: { userId: user.id } } }] : [])] },
+      orderBy: { createdAt: 'desc' }, take: 50,
+      include: {
+        owner: { select: { id: true, username: true, displayName: true } },
+        _count: { select: { messages: true, members: true } },
+        ...(user ? { members: { where: { userId: user.id }, select: { userId: true } } } : {})
+      }
+    });
+    return json(response, 200, { channels: channels.map(channel => ({
+      ...channel,
+      isMember: Boolean(user && (channel.ownerId === user.id || channel.members?.length)),
+      members: undefined
+    })) });
   }
   if (request.method === 'POST' && url.pathname === '/api/channels') {
     const user = await authenticatedUser(request);
@@ -708,9 +804,31 @@ async function handle(request, response) {
     const body = await readBody(request);
     const name = requireText(body?.name, 80);
     if (!name) return json(response, 400, { error: 'CHANNEL_NAME_REQUIRED' });
-    if (contentCheck(`${name} ${body?.description || ''}`)) return json(response, 422, { error: 'CONTENT_REJECTED' });
-    const channel = await prisma.channel.create({ data: { ownerId: user.id, name, description: requireText(body?.description, 500) || '', visibility: body?.visibility === 'private' ? 'private' : 'public' } });
+    const channelError = await submittedContentCheck(`${name} ${body?.description || ''}`);
+    if (channelError) return rejectSubmittedContent(response, channelError);
+    const channel = await prisma.$transaction(async transaction => {
+      const created = await transaction.channel.create({ data: { ownerId: user.id, name, description: requireText(body?.description, 500) || '', visibility: body?.visibility === 'private' ? 'private' : 'public' } });
+      await transaction.channelMember.create({ data: { channelId: created.id, userId: user.id } });
+      return created;
+    });
     return json(response, 201, { channel });
+  }
+
+  const channelMembershipRoute = url.pathname.match(/^\/api\/channels\/([^/]+)\/(join|leave)$/);
+  if (['POST', 'DELETE'].includes(request.method) && channelMembershipRoute) {
+    const user = await authenticatedUser(request);
+    if (!user) return json(response, 401, { error: 'AUTH_REQUIRED' });
+    const channel = await prisma.channel.findUnique({ where: { id: channelMembershipRoute[1] }, select: { id: true, ownerId: true, visibility: true } });
+    if (!channel) return json(response, 404, { error: 'CHANNEL_NOT_FOUND' });
+    if (channelMembershipRoute[2] === 'join' && request.method === 'POST') {
+      if (channel.visibility !== 'public' && channel.ownerId !== user.id) return json(response, 403, { error: 'CHANNEL_PRIVATE' });
+      await prisma.channelMember.upsert({ where: { channelId_userId: { channelId: channel.id, userId: user.id } }, update: {}, create: { channelId: channel.id, userId: user.id } });
+      return json(response, 200, { joined: true, channelId: channel.id });
+    }
+    if (channelMembershipRoute[2] !== 'leave' || request.method !== 'DELETE') return json(response, 405, { error: 'METHOD_NOT_ALLOWED' });
+    if (channel.ownerId === user.id) return json(response, 409, { error: 'CHANNEL_OWNER_CANNOT_LEAVE' });
+    await prisma.channelMember.deleteMany({ where: { channelId: channel.id, userId: user.id } });
+    return json(response, 200, { joined: false, channelId: channel.id });
   }
 
   const channelRoute = url.pathname.match(/^\/api\/channels\/([^/]+)$/);
@@ -727,7 +845,8 @@ async function handle(request, response) {
     const body = await readBody(request);
     const name = requireText(body?.name, 80);
     if (!name) return json(response, 400, { error: 'CHANNEL_NAME_REQUIRED' });
-    if (contentCheck(`${name} ${body?.description || ''}`)) return json(response, 422, { error: 'CONTENT_REJECTED' });
+    const channelError = await submittedContentCheck(`${name} ${body?.description || ''}`);
+    if (channelError) return rejectSubmittedContent(response, channelError);
     const updated = await prisma.channel.update({ where: { id: channelRoute[1] }, data: { name, description: requireText(body?.description, 500) || '' } });
     return json(response, 200, { channel: updated });
   }
@@ -738,6 +857,10 @@ async function handle(request, response) {
     const recipientId = url.searchParams.get('recipientId');
     const channelId = url.searchParams.get('channelId');
     if (!recipientId && !channelId) return json(response, 400, { error: 'MESSAGE_TARGET_REQUIRED' });
+    if (channelId) {
+      const membership = await prisma.channelMember.findUnique({ where: { channelId_userId: { channelId, userId: user.id } }, select: { channelId: true } });
+      if (!membership) return json(response, 403, { error: 'CHANNEL_MEMBERSHIP_REQUIRED' });
+    }
     const messages = await prisma.message.findMany({ where: recipientId ? { OR: [{ senderId: user.id, recipientId }, { senderId: recipientId, recipientId: user.id }] } : { channelId }, orderBy: { createdAt: 'asc' }, take: 100, include: { sender: { select: { id: true, username: true, displayName: true } } } });
     return json(response, 200, { messages });
   }
@@ -750,13 +873,21 @@ async function handle(request, response) {
     const channelId = typeof body?.channelId === 'string' ? body.channelId : null;
     const clientId = typeof body?.clientId === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(body.clientId) ? body.clientId : null;
     if (!text || (recipientId && channelId) || (!recipientId && !channelId)) return json(response, 400, { error: 'INVALID_MESSAGE' });
-    if (contentCheck(text)) return json(response, 422, { error: 'CONTENT_REJECTED' });
+    if (channelId) {
+      const membership = await prisma.channelMember.findUnique({ where: { channelId_userId: { channelId, userId: user.id } }, select: { channelId: true } });
+      if (!membership) return json(response, 403, { error: 'CHANNEL_MEMBERSHIP_REQUIRED' });
+    }
+    const messageError = await submittedContentCheck(text);
+    if (messageError) return rejectSubmittedContent(response, messageError);
     if (clientId) {
       const existingMessage = await prisma.message.findUnique({ where: { id: clientId } });
       if (existingMessage) return existingMessage.senderId === user.id ? json(response, 200, { message: existingMessage }) : json(response, 409, { error: 'CLIENT_ID_IN_USE' });
     }
     const message = await prisma.message.create({ data: { ...(clientId ? { id: clientId } : {}), senderId: user.id, recipientId, channelId, body: text }, select: { id: true, senderId: true, recipientId: true, channelId: true, body: true, createdAt: true } });
-    if (recipientId) broadcastEvent(recipientId, { type: 'message', message });
+    if (recipientId) {
+      broadcastEvent(recipientId, { type: 'message', message });
+      await pushNotification(recipientId, 'message', { actorId: user.id, actorName: user.username || user.displayName, message: `أرسل لك @${user.username || user.displayName} رسالة جديدة. افتح NEXA لقراءتها.` });
+    }
     return json(response, 201, { message });
   }
 
@@ -827,12 +958,45 @@ async function handle(request, response) {
     return;
   }
 
+  if (url.pathname === '/api/owner/links') {
+    const user = await authenticatedUser(request);
+    if (!user) return json(response, 401, { error: 'AUTH_REQUIRED' });
+    if (user.role !== 'owner') return json(response, 403, { error: 'OWNER_ONLY' });
+    if (request.method === 'GET') {
+      const [hosts, blockedAttempts] = await Promise.all([
+        redis.smembers(LINK_ALLOWLIST_KEY),
+        prisma.moderationLog.findMany({ where: { targetType: 'link', action: 'link_blocked' }, orderBy: { createdAt: 'desc' }, take: 50, select: { id: true, reason: true, createdAt: true } })
+      ]);
+      return json(response, 200, { hosts, blockedAttempts });
+    }
+    if (request.method === 'POST') {
+      const body = await readBody(request);
+      const host = normalizeAllowedHost(body?.host);
+      if (!host) return json(response, 400, { error: 'INVALID_LINK_HOST' });
+      const added = await redis.sadd(LINK_ALLOWLIST_KEY, host);
+      if (added) await prisma.moderationLog.create({ data: { moderatorId: user.id, targetType: 'link', action: 'allowlist_added', reason: host } });
+      return json(response, added ? 201 : 200, { host, added: Boolean(added) });
+    }
+  }
+
+  const ownerLinkRoute = url.pathname.match(/^\/api\/owner\/links\/([^/]+)$/);
+  if (request.method === 'DELETE' && ownerLinkRoute) {
+    const user = await authenticatedUser(request);
+    if (!user) return json(response, 401, { error: 'AUTH_REQUIRED' });
+    if (user.role !== 'owner') return json(response, 403, { error: 'OWNER_ONLY' });
+    const host = normalizeAllowedHost(decodeURIComponent(ownerLinkRoute[1]));
+    if (!host) return json(response, 400, { error: 'INVALID_LINK_HOST' });
+    const removed = await redis.srem(LINK_ALLOWLIST_KEY, host);
+    if (removed) await prisma.moderationLog.create({ data: { moderatorId: user.id, targetType: 'link', action: 'allowlist_removed', reason: host } });
+    return json(response, 200, { host, removed: Boolean(removed) });
+  }
+
   if (url.pathname.startsWith('/api/owner/ai')) {
     const user = await readSession(request);
     if (!user) return json(response, 401, { error: 'AUTH_REQUIRED' });
     if (user.role !== 'owner') return json(response, 403, { error: 'OWNER_ONLY' });
     if (request.method === 'GET' && url.pathname === '/api/owner/ai/status') {
-      return json(response, 200, { enabled: true, mode: 'proposals-only', historyCount: await prisma.aIHistory.count({ where: { ownerId: user.id } }) });
+      return json(response, 200, { enabled: Boolean(process.env.DEEPSEEK_API_KEY), googleOAuthConfigured: Boolean(process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET), mode: 'proposals-only', historyCount: await prisma.aIHistory.count({ where: { ownerId: user.id } }) });
     }
     if (request.method === 'POST' && url.pathname === '/api/owner/ai/proposals') {
       const body = await readBody(request);
@@ -864,7 +1028,7 @@ async function handle(request, response) {
     if (await prisma.user.findUnique({ where: { email } })) return json(response, 409, { error: 'EMAIL_IN_USE' });
     const accountOrder = await prisma.user.count();
     const usernameBase = usernamePrefix(email.split('@')[0]);
-    const user = await prisma.user.create({ data: { email, displayName: usernameBase, username: generatedUsername(usernameBase, accountOrder.toString(36)), verification: 'standard', identities: { create: { provider: 'email', providerSubject: email, passwordHash: await bcrypt.hash(parsed.data.password, 12) } } } });
+    const user = await prisma.user.create({ data: { email, displayName: usernameBase, username: generatedUsername(usernameBase, accountOrder.toString(36)), verification: 'standard', status: 'needs_profile_setup', identities: { create: { provider: 'email', providerSubject: email, passwordHash: await bcrypt.hash(parsed.data.password, 12) } } } });
     const token = await createEmailToken(user.id, 'verify', 24 * 60);
     await sendSecurityMail({ to: email, subject: 'فعّل حساب NEXA PRIME', title: 'تأكيد البريد الإلكتروني', text: 'اضغط الرابط لتفعيل حسابك.', link: `${appOrigin}/auth/verify-email?token=${encodeURIComponent(token)}` });
     return json(response, 201, { user: publicUser(user), message: 'VERIFICATION_EMAIL_SENT' });
@@ -893,9 +1057,10 @@ async function handle(request, response) {
   if (request.method === 'GET' && url.pathname === '/auth/verify-email') {
     const token = url.searchParams.get('token') || '';
     const record = await prisma.emailToken.findFirst({ where: { tokenHash: hashToken(token), type: 'verify', usedAt: null, expiresAt: { gt: new Date() } } });
-    if (!record) return json(response, 400, { error: 'INVALID_OR_EXPIRED_TOKEN' });
+    if (!record) return oauthErrorRedirect(response, 'EMAIL_VERIFICATION_INVALID');
     await prisma.$transaction([prisma.emailToken.update({ where: { id: record.id }, data: { usedAt: new Date() } }), prisma.user.update({ where: { id: record.userId }, data: { emailVerified: true } })]);
-    return json(response, 200, { ok: true, message: 'EMAIL_VERIFIED' });
+    response.writeHead(302, { Location: `${appOrigin.replace(/\/$/u, '')}/?email_verified=1` });
+    return response.end();
   }
 
   if (request.method === 'POST' && url.pathname === '/auth/request-password-reset') {
@@ -922,7 +1087,8 @@ async function handle(request, response) {
   }
 
   if (request.method === 'GET' && url.pathname === '/auth/google') {
-    if (!oauthEnabled()) return json(response, 503, { error: 'GOOGLE_OAUTH_NOT_CONFIGURED', message: 'Set Google OAuth variables in .env.local.' });
+    if (!oauthEnabled()) return oauthErrorRedirect(response, 'GOOGLE_OAUTH_NOT_CONFIGURED');
+    if (!servicesReady) return oauthErrorRedirect(response, 'AUTH_SERVICES_UNAVAILABLE');
     const sessionId = parseCookies(request).nexa_oauth_session || randomBytes(32).toString('base64url');
     const state = randomBytes(64).toString('base64url');
     await redis.set(`oauth_state:${sessionId}`, state, 'EX', 300);
@@ -930,34 +1096,42 @@ async function handle(request, response) {
     response.setHeader('Set-Cookie', [
       cookieString('nexa_oauth_session', sessionId, { maxAge: 600, secure: usesSecureCookies(), sameSite: usesSecureCookies() ? 'None' : 'Lax', path: '/', httpOnly: true })
     ]);
-    const params = new URLSearchParams({ client_id: process.env.GOOGLE_CLIENT_ID, redirect_uri: process.env.GOOGLE_REDIRECT_URI, response_type: 'code', scope: 'openid email profile', state, access_type: 'offline', prompt: 'select_account' });
+    const params = new URLSearchParams({ client_id: process.env.GOOGLE_CLIENT_ID, redirect_uri: googleRedirectUri(), response_type: 'code', scope: 'openid email profile', state, access_type: 'offline', prompt: 'select_account' });
     response.writeHead(302, { Location: `https://accounts.google.com/o/oauth2/v2/auth?${params}` });
     return response.end();
   }
 
   if (request.method === 'GET' && url.pathname === '/auth/google/callback') {
+    if (url.searchParams.has('error')) return oauthErrorRedirect(response, 'GOOGLE_LOGIN_CANCELLED');
     const receivedState = url.searchParams.get('state') || '';
     const code = url.searchParams.get('code');
-    if (!code || !receivedState) return json(response, 400, { error: 'MISSING_AUTH_CODE' });
+    if (!code || !receivedState) return oauthErrorRedirect(response, 'GOOGLE_LOGIN_INCOMPLETE');
     const sessionId = parseCookies(request).nexa_oauth_session || '';
     const storedState = sessionId ? (await redis.get(`oauth_state:${sessionId}`)) || '' : '';
     if (!sessionId || !storedState || receivedState !== storedState) {
       await redis.del(`oauth_state:${sessionId}`);
       await redis.del(`oauth_session:${sessionId}`);
-      return json(response, 400, { error: 'INVALID_OAUTH_STATE' });
+      return oauthErrorRedirect(response, 'GOOGLE_LOGIN_STATE_INVALID');
     }
     await redis.del(`oauth_state:${sessionId}`);
     await redis.del(`oauth_session:${sessionId}`);
-    const tokenResponse = await fetch('https://oauth2.googleapis.com/token', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ code, client_id: process.env.GOOGLE_CLIENT_ID, client_secret: process.env.GOOGLE_CLIENT_SECRET, redirect_uri: process.env.GOOGLE_REDIRECT_URI, grant_type: 'authorization_code' }) });
-    if (!tokenResponse.ok) return json(response, 401, { error: 'GOOGLE_TOKEN_EXCHANGE_FAILED' });
-    const tokens = await tokenResponse.json();
-    const profileResponse = await fetch('https://openidconnect.googleapis.com/v1/userinfo', { headers: { Authorization: `Bearer ${tokens.access_token}` } });
-    if (!profileResponse.ok) return json(response, 401, { error: 'GOOGLE_PROFILE_FAILED' });
-    const profile = await profileResponse.json();
+    let tokens;
+    let profile;
+    try {
+      const tokenResponse = await fetch('https://oauth2.googleapis.com/token', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ code, client_id: process.env.GOOGLE_CLIENT_ID, client_secret: process.env.GOOGLE_CLIENT_SECRET, redirect_uri: googleRedirectUri(), grant_type: 'authorization_code' }) });
+      if (!tokenResponse.ok) return oauthErrorRedirect(response, 'GOOGLE_TOKEN_EXCHANGE_FAILED');
+      tokens = await tokenResponse.json();
+      const profileResponse = await fetch('https://openidconnect.googleapis.com/v1/userinfo', { headers: { Authorization: `Bearer ${tokens.access_token}` } });
+      if (!profileResponse.ok) return oauthErrorRedirect(response, 'GOOGLE_PROFILE_FAILED');
+      profile = await profileResponse.json();
+    } catch {
+      return oauthErrorRedirect(response, 'GOOGLE_CONNECTION_FAILED');
+    }
     const email = String(profile.email || '').trim().toLowerCase();
-    if (!email) return json(response, 400, { error: 'GOOGLE_EMAIL_MISSING' });
-    if (profile.email_verified !== true) return json(response, 403, { error: 'GOOGLE_EMAIL_NOT_VERIFIED' });
+    if (!email) return oauthErrorRedirect(response, 'GOOGLE_EMAIL_MISSING');
+    if (profile.email_verified !== true) return oauthErrorRedirect(response, 'GOOGLE_EMAIL_NOT_VERIFIED');
     const providerSubject = String(profile.sub);
+    if (providerSubject === 'undefined') return oauthErrorRedirect(response, 'GOOGLE_SUBJECT_MISSING');
     let user = await prisma.user.findUnique({ where: { email } }) || await prisma.user.findFirst({ where: { identities: { some: { provider: 'google', providerSubject } } } });
     const firstUser = await prisma.user.count();
     if (!user) {
@@ -974,6 +1148,7 @@ async function handle(request, response) {
       const nextUsername = user.username || generatedUsername(email.split('@')[0], (user.id || '').slice(-4) || randomBytes(2).toString('hex'));
       user = await prisma.user.update({ where: { id: user.id }, data: { displayName: baseName, username: nextUsername.slice(0, 20), avatarUrl: user.avatarUrl || profile.picture || null, emailVerified: true } });
     }
+    if (user.emailVerified !== true) user = await prisma.user.update({ where: { id: user.id }, data: { emailVerified: true } });
     const needsProfileSetup = user.status === 'needs_profile_setup' || !user.displayName || !user.username;
     const sessionPayload = buildSessionUser({ ...user, status: needsProfileSetup ? 'needs_profile_setup' : 'active', emailVerified: true });
     await setSession(response, sessionPayload);
@@ -1010,7 +1185,7 @@ async function handle(request, response) {
   if (request.method === 'POST' && url.pathname === '/api/moderation/check') {
     const body = await readBody(request);
     if (!body || typeof body.text !== 'string') return json(response, 400, { error: 'TEXT_REQUIRED' });
-    const matched = contentCheck(body.text);
+    const matched = contentCheck(body.text) || linkCheck(body.text, await redis.smembers(LINK_ALLOWLIST_KEY));
     return json(response, 200, { allowed: !matched, matched });
   }
 

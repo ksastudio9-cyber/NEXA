@@ -7,11 +7,11 @@ services:
     environment:
       NODE_ENV: production
       PORT: 5173
+      CODESPACE_NAME: ${CODESPACE_NAME:-}
       APP_ORIGIN: ${APP_ORIGIN:?Set APP_ORIGIN in .env}
       GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
       GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
-      OWNER_EMAIL: ${OWNER_EMAIL:?Set OWNER_EMAIL in .env}
-      GOOGLE_REDIRECT_URI: ${GOOGLE_REDIRECT_URI:-http://localhost:5173/auth/google/callback}
+      GOOGLE_REDIRECT_URI: ${GOOGLE_REDIRECT_URI:-}
       DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
       S3_PROVIDER: ${S3_PROVIDER:-minio}
       S3_ENDPOINT: ${S3_ENDPOINT:-http://minio:9000}
@@ -38,9 +38,9 @@ services:
       AWS_SESSION_TOKEN: ${AWS_SESSION_TOKEN:-}
       SMTP_HOST: ${SMTP_HOST:-smtp.gmail.com}
       SMTP_PORT: ${SMTP_PORT:-587}
-      SMTP_USER: ${SMTP_USER:-no-reply@example.com}
-      SMTP_PASS: ${SMTP_PASS:-replace-with-smtp-password}
-      SMTP_FROM: ${SMTP_FROM:-no-reply@nexa.app}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASS: ${SMTP_PASS:-}
+      SMTP_FROM: ${SMTP_FROM:-}
     ports:
       - "5173:5173"
     depends_on:
@@ -65,6 +65,8 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:-nexa}
       POSTGRES_USER: ${POSTGRES_USER:-nexa}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+    ports:
+      - "127.0.0.1:5432:5432"
     volumes:
       - nexa-postgres:/var/lib/postgresql/data
     networks:
@@ -80,6 +82,8 @@ services:
     image: redis:7-alpine
     restart: unless-stopped
     command: redis-server --appendonly yes
+    ports:
+      - "127.0.0.1:6379:6379"
     volumes:
       - nexa-redis:/data
     networks:
@@ -119,4 +123,4 @@ volumes:
 networks:
   frontend:
   backend:
-    internal: true
+    internal: ${BACKEND_NETWORK_INTERNAL:-true}

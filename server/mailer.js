@@ -12,11 +12,28 @@ export function smtpEnabled() {
   return Boolean(transporter);
 }
 
+function escapeHtml(value) {
+  return String(value).replace(/[&<>"']/g, character => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[character]));
+}
+
+export async function sendAccountNotification({ to, subject, text }) {
+  if (!transporter) return false;
+  const safeText = escapeHtml(text);
+  await transporter.sendMail({
+    from: `"${process.env.SMTP_FROM_NAME || 'NEXA PRIME'}" <${process.env.SMTP_FROM || process.env.SMTP_USER}>`,
+    to,
+    subject,
+    text,
+    html: `<main dir="rtl" style="font-family:Arial,sans-serif;max-width:560px;margin:32px auto;padding:24px;border:1px solid #ddd;border-radius:12px"><h1>${escapeHtml(subject)}</h1><p>${safeText}</p></main>`
+  });
+  return true;
+}
+
 export async function sendSecurityMail({ to, subject, title, text, link }) {
   if (!transporter) throw new Error('SMTP_NOT_CONFIGURED');
   const fromName = process.env.SMTP_FROM_NAME || 'NEXA PRIME';
   return transporter.sendMail({
-    from: `"${fromName}" <${process.env.SMTP_USER}>`,
+    from: `"${fromName}" <${process.env.SMTP_FROM || process.env.SMTP_USER}>`,
     to,
     subject,
     text: `${title}\n\n${text}\n\n${link}`,

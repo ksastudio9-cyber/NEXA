@@ -47,10 +47,17 @@ const icons = {
 };
 
 if ('serviceWorker' in navigator) {
-  navigator.serviceWorker.addEventListener('controllerchange', () => window.location.reload());
-  window.addEventListener('load', () => {
-    navigator.serviceWorker.register('/sw.js').then(registration => registration.update()).catch(() => {});
-  });
+  if (import.meta.env.DEV) {
+    navigator.serviceWorker.getRegistrations().then(registrations => Promise.all(registrations.map(registration => registration.unregister())))
+      .then(() => caches.keys())
+      .then(keys => Promise.all(keys.filter(key => key.startsWith('nexa-cache-')).map(key => caches.delete(key))))
+      .catch(() => {});
+  } else {
+    navigator.serviceWorker.addEventListener('controllerchange', () => window.location.reload());
+    window.addEventListener('load', () => {
+      navigator.serviceWorker.register('/sw.js').then(registration => registration.update()).catch(() => {});
+    });
+  }
 }
 
 const state = {
@@ -65,11 +72,22 @@ const state = {
   deviceTrusted: readLocalValue('nexa-device-trusted') === 'true',
   active: 'feed',
   feedFilter: 'for-you',
+  profileTab: 'videos',
+  messageFilter: 'all',
+  messageQuery: '',
+  spaceFilter: 'all',
+  studioMode: 'video',
+  studioEffect: 0,
+  studioFrameRate: 30,
   liked: new Set(),
   saved: new Set(),
   subscribed: new Set(readLocalJson('nexa-following', [], Array.isArray)),
+  joinedSpaces: new Set(readLocalJson('nexa-joined-spaces', [], Array.isArray)),
+  userCommunities: readLocalJson('nexa-user-communities', [], Array.isArray),
   selectedChat: 0,
   selectedRecipientId: null,
+  activeChannelId: null,
+  channelMessages: [],
   sentMessages: [],
   userVideos: [],
   remotePosts: [],
@@ -94,6 +112,31 @@ const state = {
 };
 
 const apiOrigin = '';
+const oauthErrorMessages = {
+  GOOGLE_OAUTH_NOT_CONFIGURED: 'تسجيل Google غير مفعّل بعد. أضف بيانات OAuth الصحيحة إلى إعدادات الخادم.',
+  AUTH_SERVICES_UNAVAILABLE: 'خدمات الحساب غير متاحة الآن. حاول مجددًا بعد قليل.',
+  EMAIL_VERIFICATION_INVALID: 'رابط تأكيد البريد غير صالح أو انتهت صلاحيته. اطلب رسالة تأكيد جديدة.',
+  GOOGLE_LOGIN_CANCELLED: 'ألغيت تسجيل الدخول عبر Google.',
+  GOOGLE_LOGIN_INCOMPLETE: 'لم يكتمل تسجيل الدخول عبر Google، حاول مرة أخرى.',
+  GOOGLE_LOGIN_STATE_INVALID: 'تعذر تأكيد جلسة Google. أعد المحاولة.',
+  GOOGLE_TOKEN_EXCHANGE_FAILED: 'تعذر تأكيد حساب Google. تحقق من إعدادات OAuth.',
+  GOOGLE_PROFILE_FAILED: 'تعذر جلب ملفك من Google. حاول مرة أخرى.',
+  GOOGLE_CONNECTION_FAILED: 'تعذر الاتصال بخدمة Google. تحقق من الإنترنت وحاول مجددًا.',
+  GOOGLE_EMAIL_MISSING: 'لم يرجع Google بريدًا إلكترونيًا للحساب.',
+  GOOGLE_EMAIL_NOT_VERIFIED: 'يجب تأكيد البريد في Google قبل المتابعة.',
+  GOOGLE_SUBJECT_MISSING: 'تعذر تحديد حساب Google. حاول مرة أخرى.'
+};
+const oauthErrorCode = new URLSearchParams(window.location.search).get('auth_error');
+if (oauthErrorCode) {
+  state.authScreen = 'login';
+  state.authError = oauthErrorMessages[oauthErrorCode] || 'تعذر تسجيل الدخول عبر Google. حاول مرة أخرى.';
+  window.history.replaceState({}, '', window.location.pathname);
+}
+if (new URLSearchParams(window.location.search).get('email_verified') === '1') {
+  state.authScreen = 'login';
+  state.authError = 'تم تأكيد بريدك بنجاح. سجّل الدخول لإكمال الاسم المعروض واليوزر.';
+  window.history.replaceState({}, '', window.location.pathname);
+}
 
 async function api(path, options = {}) {
   const { skipRefresh = false, ...requestOptions } = options;
@@ -168,10 +211,14 @@ function authErrorMessage(error) {
     INVALID_CREDENTIALS: 'أدخل بريدًا صالحًا وكلمة مرور من 8 أحرف على الأقل.',
     INVALID_PROFILE: 'تحقق من الاسم واليوزر. يجب أن يبدأ اليوزر بحرف إنجليزي ويكون طوله من 3 إلى 20 محرفًا.',
     INVALID_LOGIN: 'البريد الإلكتروني أو كلمة المرور غير صحيحة.',
-    ORIGIN_NOT_ALLOWED: 'رابط الموقع غير معتمد للخادم. افتح أحدث رابط Codespaces للمنفذ 5173 أو حدّث APP_ORIGIN.',
+    ORIGIN_NOT_ALLOWED: 'تعذر إكمال الطلب. حدّث الصفحة وحاول مجددًا.',
     RATE_LIMITED: 'محاولات كثيرة؛ انتظر قليلًا ثم أعد المحاولة.',
     RATE_LIMIT_UNAVAILABLE: 'تعذر التحقق الأمني مؤقتًا. حاول بعد قليل.',
     SMTP_NOT_CONFIGURED: 'التسجيل أو استعادة الحساب بالبريد غير مفعّل على الخادم. استخدم Google أو تواصل مع مسؤول التطبيق.',
+    OWNER_EMAIL_NOT_VERIFIED: 'يجب تأكيد بريدك الإلكتروني قبل حجز اسم the_x.',
+    OWNER_ALREADY_ASSIGNED: 'تم حجز صلاحية المالك من حساب آخر؛ اسم the_x غير متاح.',
+    OWNER_USERNAME_RESERVED: 'لا يمكن تغيير اسم المستخدم المحجوز للمالك.',
+    OWNER_USERNAME_REQUIRED: 'اختر اسم المستخدم the_x لإكمال إعداد صلاحية المالك.',
     SERVICES_UNAVAILABLE: 'خدمات التطبيق متوقفة مؤقتًا. أعد المحاولة بعد تشغيل الخادم وقاعدة البيانات.',
     UPLOAD_CAPACITY_REACHED: 'الخادم مشغول الآن. أعد المحاولة بعد قليل.'
   };
@@ -290,6 +337,14 @@ function persistFollowing() {
   localStorage.setItem('nexa-following', JSON.stringify([...state.subscribed]));
 }
 
+function persistJoinedSpaces() {
+  writeLocalValue('nexa-joined-spaces', JSON.stringify([...state.joinedSpaces]));
+}
+
+function persistUserCommunities() {
+  writeLocalValue('nexa-user-communities', JSON.stringify(state.userCommunities));
+}
+
 function currentUser() {
   return state.activeUser || { username: 'مستخدم جديد', email: '', avatar: 'N', color: 'coral', verification: 'standard', followers: 0 };
 }
@@ -342,7 +397,8 @@ async function hydrateBackendSession() {
       role: normalizeRole(profile.role),
       developerStatus: 'pending',
       provider: profile.provider,
-      status: profile.status || 'active'
+      status: profile.status || 'active',
+      notificationsEnabled: profile.notificationsEnabled !== false
     };
     const existingIndex = state.users.findIndex(item => item.email === user.email);
     if (existingIndex >= 0) state.users[existingIndex] = { ...state.users[existingIndex], ...user };
@@ -496,9 +552,11 @@ async function saveProfileForm(form) {
   }
   if (displayName.length < 2) { state.authError = 'اكتب اسماً معروضاً صالحاً.'; render(); return; }
   const target = state.pendingUser || state.activeUser;
+  let savedUsername = username.toLowerCase() === 'the_x' ? 'the_x' : username;
   if (target?.id && !String(target.id).startsWith('usr_')) {
     try {
       const result = await api('/api/me', { method: 'PATCH', body: JSON.stringify({ displayName, username }) });
+      savedUsername = result.user.username || savedUsername;
       Object.assign(target, { ...result.user, avatar: displayName.slice(0, 1).toUpperCase(), profileSetup: true });
     } catch (error) {
       state.authError = error.message === 'USERNAME_IN_USE' ? 'اسم المستخدم مستخدم بالفعل، اختر يوزرًا آخر.' : moderationMessage(error) || authErrorMessage(error);
@@ -506,13 +564,14 @@ async function saveProfileForm(form) {
       return;
     }
   }
-  Object.assign(target, { displayName, username, bio: String(values.get('bio') || '').trim(), avatar: displayName.slice(0, 1).toUpperCase(), profileSetup: true });
+  Object.assign(target, { displayName, username: savedUsername, bio: String(values.get('bio') || '').trim(), avatar: displayName.slice(0, 1).toUpperCase(), profileSetup: true });
   const index = state.users.findIndex(user => user.email === target.email);
   if (index >= 0) state.users[index] = target;
   state.pendingUser = null;
   state.authError = '';
   state.activeUser = target;
   state.activeUser.profileSetup = true;
+  state.serverOwner = normalizeRole(target.role) === 'owner';
   state.deviceTrusted = true;
   state.active = 'feed';
   state.authScreen = 'guest';
@@ -549,7 +608,7 @@ function displayChannels() {
 }
 
 function avatar(letter, color, size = '') { return `<span class="avatar ${color} ${size}">${letter}</span>`; }
-function nav() { const items = [...navItems, ['developers', icons.settings, 'صفحة المطورين']]; if (['owner', 'moderator'].includes(state.activeUser?.role)) items.push(['moderation', icons.shield, 'مراجعة المحتوى']); return items.map(([id, icon, label]) => `<button class="nav-item ${state.active === id ? 'active' : ''}" data-nav="${id}" ${id !== 'feed' ? 'data-requires-auth' : ''}><span class="nav-icon">${icon}</span><span>${label}</span>${id === 'messages' ? '<b class="nav-badge">3</b>' : ''}</button>`).join(''); }
+function nav() { const items = [...navItems, ['developers', icons.settings, 'صفحة المطورين']]; if (['owner', 'moderator'].includes(state.activeUser?.role)) items.push(['moderation', icons.shield, 'مراجعة المحتوى']); return items.map(([id, icon, label]) => `<button class="nav-item ${state.active === id ? 'active' : ''}" data-nav="${id}" ${id !== 'feed' ? 'data-requires-auth' : ''}><span class="nav-icon">${icon}</span><span>${label}</span>${id === 'messages' && state.unreadNotifications ? `<b class="nav-badge">${Math.min(state.unreadNotifications, 9)}</b>` : ''}</button>`).join(''); }
 
 function authShell(content) { return `<div class="auth-shell"><div class="auth-art"><div class="auth-orbit orbit-one"></div><div class="auth-orbit orbit-two"></div><span class="auth-n">N</span><div class="auth-art-copy"><span class="eyebrow">NEXA / SOCIAL OS</span><h1>كل عالمك.<br /><em>في مكان واحد.</em></h1><p>فيديوهات، محادثات، مجتمعات وصوتك الخاص.</p></div></div><main class="auth-panel"><div class="auth-brand"><span class="brand-mark">N</span><strong>NEXA</strong></div>${content}<small class="auth-footer">بالاستمرار، أنت توافق على شروط الاستخدام وسياسة الخصوصية.</small></main></div>`; }
 
@@ -559,7 +618,7 @@ function loginView() { return authShell(`<div class="auth-heading"><span class="
 
 function registerView() { return authShell(`<div class="auth-heading"><span class="eyebrow">انضم إلى NEXA</span><h2>أنشئ حسابك</h2><p>بعد تأكيد بريدك الإلكتروني، أكمل إعداد ملفك الشخصي.</p></div>${authError()}<form class="auth-form" data-auth="register"><label>البريد الإلكتروني<input name="email" type="email" placeholder="you@example.com" autocomplete="email" required /></label><label>كلمة المرور<div class="password-field"><input name="password" type="password" placeholder="8 أحرف على الأقل" autocomplete="new-password" required minlength="8" /><button type="button" data-toggle-password>إظهار</button></div></label><button class="auth-submit" type="submit">${state.authLoading ? 'جارٍ إنشاء الحساب...' : 'إنشاء الحساب'} <span>←</span></button></form><p class="auth-switch">لديك حساب بالفعل؟ <button data-auth-screen="login">تسجيل الدخول</button></p>`); }
 
-function forcedNameView() { const user = state.pendingUser || state.activeUser || { displayName: '', username: '' }; return authShell(`<div class="auth-heading"><span class="eyebrow">إكمال الحساب</span><h2>اختر اسمك في NEXA</h2><p>اكتب الاسم الظاهر واليوزر الذي سيستخدمه الآخرون للعثور عليك.</p></div>${authError()}<form class="auth-form" data-profile-setup><label>الاسم المعروض<input name="displayName" value="${user.displayName || ''}" required minlength="2" maxlength="30" autocomplete="name" /></label><label>اسم المستخدم<input name="username" value="${user.username || ''}" pattern="${USERNAME_PATTERN.source}" placeholder="nexa_user" required minlength="3" maxlength="20" autocomplete="username" /><small class="field-hint">يبدأ بحرف إنجليزي، ثم أحرف أو أرقام أو _ (من 3 إلى 20 محرفًا)</small></label><button class="auth-submit" type="submit">${state.authLoading ? 'جارٍ الحفظ...' : 'حفظ والدخول'} <span>←</span></button></form>`); }
+function forcedNameView() { const user = state.pendingUser || state.activeUser || { displayName: '', username: '' }; const needsSetup = user.profileSetup === false || user.status === 'needs_profile_setup'; return authShell(`<div class="auth-heading"><span class="eyebrow">إكمال الحساب</span><h2>اختر اسمك في NEXA</h2><p>البريد محفوظ لحسابك. أدخل الاسم المعروض واليوزر لإكمال التسجيل.</p></div>${authError()}<form class="auth-form" data-profile-setup><label>البريد الإلكتروني<input type="email" value="${escapeHtml(user.email || '')}" readonly /></label><label>الاسم المعروض<input name="displayName" value="${needsSetup ? '' : escapeHtml(user.displayName || '')}" required minlength="2" maxlength="30" autocomplete="name" /></label><label>اسم المستخدم<input name="username" value="${needsSetup ? '' : escapeHtml(user.username || '')}" pattern="${USERNAME_PATTERN.source}" placeholder="nexa_user" required minlength="3" maxlength="20" autocomplete="username" /><small class="field-hint">يبدأ بحرف إنجليزي، ثم أحرف أو أرقام أو _ (من 3 إلى 20 محرفًا)</small></label><button class="auth-submit" type="submit">${state.authLoading ? 'جارٍ الحفظ...' : 'حفظ والدخول'} <span>←</span></button></form>`); }
 
 function deviceBindView() { const user = state.pendingUser || currentUser(); return authShell(`<div class="device-icon">${icons.shield}</div><div class="auth-heading centered"><span class="eyebrow">خطوة أمان أخيرة</span><h2>اربط جهازك</h2><p>نحتاج لتوثيق هذا الجهاز حتى يبقى حسابك آمناً.</p></div><div class="device-card"><div class="device-symbol">⌁</div><div><strong>جهاز Linux الحالي</strong><small>تم اكتشافه الآن · موقع تقريبي محلي</small></div><span class="device-check">✓</span></div>${authError()}<button class="auth-submit" data-bind-device>${state.authLoading ? 'جارٍ التحقق...' : 'توثيق هذا الجهاز'} <span>←</span></button><button class="ghost-btn" data-auth-screen="login">إلغاء والعودة</button><small class="device-note">لن نطلب هذا التحقق مجدداً على هذا الجهاز الموثوق.</small>`); }
 
@@ -567,6 +626,7 @@ function shell(content, title, eyebrow = '') {
   const user = currentUser();
   const guest = !isAuthenticated();
     return `<div class="app-shell"><aside class="sidebar"><div class="brand"><button class="brand-mark" data-logo-trigger aria-label="NEXA">N</button><span>NEXA</span></div><div class="profile-mini">${avatar(user.avatar, user.color)}<div><strong>${guest ? 'زائر NEXA' : `${user.displayName || user.username} ${verificationBadge(user)}`}</strong><small>${guest ? 'شاهد بدون حساب' : `@${user.username}`}</small></div><span class="status-dot"></span></div><nav class="primary-nav"><small class="nav-label">${guest ? 'تصفح كزائر' : 'المساحة الشخصية'}</small>${nav()}<small class="nav-label space">استكشف أكثر</small><button class="nav-item"><span class="nav-icon">${icons.search}</span><span>بحث عالمي</span></button><button class="nav-item"><span class="nav-icon">${icons.bookmark}</span><span>المحفوظات</span></button></nav><div class="sidebar-bottom">${guest ? '<button class="guest-login" data-auth-screen="login">تسجيل الدخول <span>←</span></button>' : `<div class="trust"><span>${icons.shield}</span><div><strong>حساب موثوق</strong><small>TrustScore 94%</small></div></div><button class="nav-item" data-add-account><span class="nav-icon">${icons.plus}</span><span>إضافة حساب</span></button><button class="nav-item" data-switch-account><span class="nav-icon">${icons.settings}</span><span>تبديل الحساب</span></button>`}</div></aside><main class="main"><header class="topbar"><div><span class="eyebrow">${eyebrow}</span><h1>${title}</h1></div><div class="top-actions"><button class="icon-btn" data-bell-button aria-label="الإشعارات">${icons.bell}${state.unreadNotifications ? `<i class="notification-count">${Math.min(state.unreadNotifications, 9)}</i>` : ''}</button><button class="create-btn" data-nav="studio"><span>${icons.plus}</span> إنشاء</button>${guest ? '<button class="header-login" data-auth-screen="login">دخول</button>' : `<button class="profile-edit-trigger" data-profile-edit aria-label="تعديل البروفايل">${icons.settings}<span>تعديل البروفايل</span></button><button class="logout-btn" data-logout type="button">تسجيل الخروج</button>${avatar(user.avatar, user.color)}`}</div></header>${content}</main><aside class="right-rail"><section class="rail-card profile-card"><div class="cover"></div><div class="profile-card-body">${avatar(user.avatar, user.color, 'large')}<button class="edit-btn" data-profile-edit>${guest ? 'إنشاء ملفك' : 'تعديل الملف'}</button><h3>${guest ? 'زائر NEXA' : `${user.displayName || user.username} ${verificationBadge(user)}`}</h3><p>${guest ? 'سجّل لتخصيص تجربتك' : `@${user.username}`}</p><div class="profile-stats"><span><b>${user.followers || 0}</b>متابع</span><span><b>0</b>يتابع</span><span><b>${state.userVideos.length}</b>منشور</span></div></div></section><section class="rail-section trends"><div class="section-heading"><h3>ابدأ رحلتك</h3></div><p>${guest ? 'شاهد الفيديوهات الآن، وسجّل للحفظ والتعليق والنشر.' : 'أنشئ أول فيديو وشاركه مع مجتمع NEXA.'}</p></section></aside></div>`;
+      return `<div class="app-shell"><aside class="sidebar"><div class="brand"><button class="brand-mark" data-logo-trigger aria-label="NEXA">N</button><span>NEXA</span></div><div class="profile-mini">${avatar(user.avatar, user.color)}<div><strong>${guest ? 'زائر NEXA' : `${user.displayName || user.username} ${verificationBadge(user)}`}</strong><small>${guest ? 'شاهد بدون حساب' : `@${user.username}`}</small></div><span class="status-dot"></span></div><nav class="primary-nav"><small class="nav-label">${guest ? 'تصفح كزائر' : 'المساحة الشخصية'}</small>${nav()}<small class="nav-label space">استكشف أكثر</small><button class="nav-item ${state.active === 'explore' ? 'active' : ''}" data-nav="explore"><span class="nav-icon">${icons.search}</span><span>بحث عالمي</span></button><button class="nav-item ${state.active === 'saved' ? 'active' : ''}" data-nav="saved" data-requires-auth><span class="nav-icon">${icons.bookmark}</span><span>المحفوظات</span></button></nav><div class="sidebar-bottom">${guest ? '<button class="guest-login" data-auth-screen="login">تسجيل الدخول <span>←</span></button>' : `<div class="trust"><span>${icons.shield}</span><div><strong>حساب موثوق</strong><small>TrustScore 94%</small></div></div><button class="nav-item" data-add-account><span class="nav-icon">${icons.plus}</span><span>إضافة حساب</span></button><button class="nav-item" data-switch-account><span class="nav-icon">${icons.settings}</span><span>تبديل الحساب</span></button>`}</div></aside><main class="main"><header class="topbar"><div><span class="eyebrow">${eyebrow}</span><h1>${title}</h1></div><div class="top-actions"><button class="icon-btn" data-bell-button aria-label="الإشعارات">${icons.bell}${state.unreadNotifications ? `<i class="notification-count">${Math.min(state.unreadNotifications, 9)}</i>` : ''}</button><button class="create-btn" data-nav="studio"><span>${icons.plus}</span> إنشاء</button>${guest ? '<button class="header-login" data-auth-screen="login">دخول</button>' : `<button class="profile-edit-trigger" data-profile-edit aria-label="تعديل البروفايل">${icons.settings}<span>تعديل البروفايل</span></button><button class="logout-btn" data-logout type="button">تسجيل الخروج</button>${avatar(user.avatar, user.color)}`}</div></header>${content}</main><aside class="right-rail"><section class="rail-card profile-card"><div class="cover"></div><div class="profile-card-body">${avatar(user.avatar, user.color, 'large')}<button class="edit-btn" data-profile-edit>${guest ? 'إنشاء ملفك' : 'تعديل الملف'}</button><h3>${guest ? 'زائر NEXA' : `${user.displayName || user.username} ${verificationBadge(user)}`}</h3><p>${guest ? 'سجّل لتخصيص تجربتك' : `@${user.username}`}</p><div class="profile-stats"><span><b>${user.followers || 0}</b>متابع</span><span><b>0</b>يتابع</span><span><b>${state.userVideos.length}</b>منشور</span></div></div></section><section class="rail-section trends"><div class="section-heading"><h3>ابدأ رحلتك</h3></div><p>${guest ? 'شاهد الفيديوهات الآن، وسجّل للحفظ والتعليق والنشر.' : 'أنشئ أول فيديو وشاركه مع مجتمع NEXA.'}</p></section></aside></div>`;
 }
 
 function feedView() {
@@ -601,15 +661,27 @@ function messagesView() {
   const messages = [...state.remoteMessages, ...queuedMessages].sort((left, right) => left.createdAt.localeCompare(right.createdAt));
   const messageList = messages.length ? messages.map(message => `<div class="message ${message.from === 'me' ? 'sent' : 'received'} ${message.queued ? 'queued' : ''}">${escapeHtml(message.body)}<small>${message.needsReview ? 'تحتاج مراجعة' : message.queued ? 'محفوظة على الجهاز · بانتظار الإرسال' : new Date(message.createdAt).toLocaleTimeString('ar-EG', { hour: '2-digit', minute: '2-digit' })}</small>${message.queued ? `<button class="offline-remove" data-remove-offline="${escapeHtml(message.id)}" aria-label="حذف الرسالة المحفوظة">حذف</button>` : ''}</div>`).join('') : '<div class="message received">ابدأ المحادثة وأرسل أول رسالة.</div>';
 
-  return shell(`<div class="messages-layout"><section class="chat-list"><div class="list-header"><div><h2>الرسائل</h2><small>تواصل مع دائرتك</small></div><button class="round-add">${icons.plus}</button></div><div class="message-search">${icons.search}<input placeholder="البحث في المحادثات" /></div><div class="chat-tabs"><button class="selected">الكل</button><button>غير مقروءة</button><button>مجموعات</button></div>${state.conversationUsers.map((c, i) => `<button class="chat-row ${c.userId === state.selectedRecipientId ? 'selected' : ''}" data-chat="${c.userId}">${avatar(c.avatar, c.color)}<div class="chat-info"><strong>${c.name}</strong><small>${c.preview}</small></div><div class="chat-meta"><small>${c.time}</small></div></button>`).join('')}</section><section class="chat-window"><header class="chat-header">${avatar(chat.avatar, chat.color)}<div><strong>${chat.name}</strong><small>${chat.online ? 'متصل الآن' : 'آخر ظهور اليوم'}</small></div><div class="chat-tools"><button>${icons.search}</button><button>${icons.more}</button></div></header><div class="chat-messages">${messageList}</div><form class="composer"><button type="button" class="attach-btn">${icons.plus}</button><input id="message-input" placeholder="اكتب رسالة..." autocomplete="off" /><button type="button" class="emoji-btn">☺</button><button class="send-btn" aria-label="إرسال">${icons.send}</button></form></section></div>`, 'محادثاتك', 'التواصل');
+  return shell(`<div class="messages-layout"><section class="chat-list"><div class="list-header"><div><h2>الرسائل</h2><small>تواصل مع دائرتك</small></div><button class="round-add" data-new-chat aria-label="محادثة جديدة">${icons.plus}</button></div><div class="message-search">${icons.search}<input data-message-search placeholder="البحث في المحادثات" /></div><div class="chat-tabs"><button class="${state.messageFilter === 'all' ? 'selected' : ''}" data-message-filter="all">الكل</button><button class="${state.messageFilter === 'unread' ? 'selected' : ''}" data-message-filter="unread">غير مقروءة</button><button class="${state.messageFilter === 'groups' ? 'selected' : ''}" data-message-filter="groups">مجموعات</button></div><div data-chat-list>${state.conversationUsers.map(c => `<button class="chat-row ${c.userId === state.selectedRecipientId ? 'selected' : ''}" data-chat="${c.userId}">${avatar(c.avatar, c.color)}<div class="chat-info"><strong>${escapeHtml(c.name)}</strong><small>${escapeHtml(c.preview)}</small></div><div class="chat-meta"><small>${escapeHtml(c.time)}</small></div></button>`).join('')}</div><p class="chat-list-empty" data-chat-list-empty hidden></p></section><section class="chat-window"><header class="chat-header">${avatar(chat.avatar, chat.color)}<div><strong>${escapeHtml(chat.name)}</strong><small>${chat.online ? 'متصل الآن' : 'آخر ظهور اليوم'}</small></div><div class="chat-tools"><button type="button" data-chat-action="search" aria-label="البحث في المحادثة">${icons.search}</button><button type="button" data-chat-action="details" aria-label="تفاصيل المحادثة">${icons.more}</button></div></header><div class="chat-messages">${messageList}</div><form class="composer"><input id="message-input" placeholder="اكتب رسالة..." autocomplete="off" /><button type="button" class="emoji-btn" data-insert-emoji aria-label="إضافة رمز تعبيري">☺</button><button class="send-btn" aria-label="إرسال">${icons.send}</button></form></section></div>`, 'محادثاتك', 'التواصل');
 }
 
 function channelsView() { return shell(`<div class="channels-page"><div class="channel-hero"><div><span class="eyebrow">مساحتك الصوتية</span><h2>تابع ما يهمك.<br /><em>بصوتك الخاص.</em></h2><p>قنوات مستقلة، مجتمعات حقيقية، ومحتوى يصل إليك في وقته.</p><button class="primary-btn">اكتشف القنوات <span>←</span></button></div><div class="hero-signal"><div class="signal-line"></div><span>● مباشر الآن</span><strong>${displayChannels().length}</strong><small>قناة نشطة</small></div></div><div class="page-heading"><div><h2>القنوات المقترحة</h2><p>مختارة بناءً على اهتماماتك</p></div><button class="outline-btn">عرض الكل</button></div><div class="channel-grid">${displayChannels().map(c => `<article class="channel-card"><div class="channel-cover ${c.color}"><span>${c.avatar}</span><small>● ${c.verified ? 'موثق' : 'نشط الآن'}</small></div><div class="channel-body">${avatar(c.avatar, c.color, 'medium')}<h3>${c.name} ${c.verified ? '<span class="verified">✓</span>' : ''}</h3><p>${c.desc}</p><small>${c.members} رسالة</small><button class="channel-follow ${state.subscribed.has(c.id || c.name) ? 'following' : ''}" data-subscribe="${c.id || c.name}">${state.subscribed.has(c.id || c.name) ? 'تتابعها' : 'متابعة القناة'}</button></div></article>`).join('')}</div></div>`, 'القنوات', 'اكتشف'); }
 
+function channelChatView() {
+  const channel = state.remoteChannels.find(item => item.id === state.activeChannelId);
+  if (!channel) return shell('<div class="messages-empty"><h2>القناة غير متاحة</h2><button class="primary-btn" data-nav="spaces">العودة للقنوات</button></div>', 'القنوات', 'المساحات');
+  const messages = state.channelMessages.map(message => `<div class="message ${message.senderId === state.activeUser?.id ? 'sent' : 'received'}">${escapeHtml(message.body)}<small>${escapeHtml(message.sender?.displayName || message.sender?.username || '')} · ${new Date(message.createdAt).toLocaleTimeString('ar-EG', { hour: '2-digit', minute: '2-digit' })}</small></div>`).join('') || '<div class="message received">ابدأ الحديث في القناة.</div>';
+  return shell(`<div class="channel-chat"><header class="chat-header"><button class="outline-btn" data-nav="spaces">القنوات</button><div><strong>${escapeHtml(channel.name)}</strong><small>${channel._count?.members || 1} عضو</small></div></header><div class="chat-messages">${messages}</div><form class="composer" data-channel-composer><input name="body" placeholder="اكتب رسالة للقناة..." maxlength="2000" autocomplete="off" required /><button class="send-btn" aria-label="إرسال">${icons.send}</button></form></div>`, channel.name, 'محادثة قناة');
+}
+
 function studioView() { return shell(`<div class="studio-page"><section class="studio-canvas"><div class="camera-frame"><div class="camera-grid"></div><div class="camera-top"><span class="recording-dot"></span> 00:00:12 <button>×</button></div><div class="camera-center"><span class="face-orbit">✦</span><p>اضغط لالتقاط اللحظة</p></div><div class="camera-bottom"><button class="studio-control">⌁<small>سرعة</small></button><button class="capture"><span></span></button><button class="studio-control">◌<small>فلاتر</small></button></div></div></section><aside class="studio-panel"><div class="panel-head"><div><span class="eyebrow">NEXA STUDIO</span><h2>اصنع لحظتك</h2></div><button class="icon-btn">⚙</button></div><div class="mode-switch"><button class="selected">فيديو</button><button>صورة</button><button>بث مباشر</button></div><div class="effects-title"><h3>تأثيرات اليوم</h3><button>الكل</button></div><div class="effects-grid">${['✦','◒','✺','◉','⌁','◇'].map((x, i) => `<button class="effect ${i === 0 ? 'selected' : ''}"><span>${x}</span><small>${['نقي','Glow','نظرة','عكس','حبيبات','حالم'][i]}</small></button>`).join('')}</div><div class="studio-note"><span>${icons.shield}</span><p><strong>DeepGuard نشط</strong><br />محتواك محمي قبل النشر.</p></div></aside></div>`, 'الاستوديو', 'إنشاء'); }
 
 function communitiesView() { return shell(`<div class="community-page"><div class="page-heading"><div><span class="eyebrow">مجتمعاتك</span><h2>معاً، نصنع أكثر</h2><p>مساحات آمنة للحوار والعمل المشترك.</p></div><button class="primary-btn">${icons.plus} مجتمع جديد</button></div><div class="community-layout"><section><article class="community-feature"><div class="community-banner"><span>◈</span><small>مساحة موصى بها</small></div><div class="community-content">${avatar('ت','purple','large')}<div><h2>تقنية الغد</h2><p>نناقش الأدوات التي ستصنع عالمنا القادم.</p><div class="member-stack">${['م','ر','س','ن'].map((x,i) => avatar(x, ['coral','blue','green','yellow'][i])).join('')}<small>+ 4.2K عضو</small></div></div><button class="join-btn">انضمام</button></div></article></section><aside class="roles-panel"><h3>نشاط المجتمع</h3><div class="activity-item"><span class="activity-icon blue">↗</span><p><strong>سارة</strong> نشرت في <b>#التصميم</b><small>منذ 4 دقائق</small></p></div><div class="activity-item"><span class="activity-icon coral">✦</span><p><strong>ياسر</strong> بدأ موضوعاً جديداً<small>منذ 18 دقيقة</small></p></div><div class="activity-item"><span class="activity-icon green">♧</span><p><strong>ريم</strong> انضمت للمجتمع<small>منذ 42 دقيقة</small></p></div></aside></div></div>`, 'المجتمعات', 'انتمِ'); }
-function spacesView() { return shell(`<div class="spaces-page"><div class="page-heading"><div><span class="eyebrow">مساحة واحدة</span><h2>القنوات والمجتمعات</h2><p>كل مساحاتك في قائمة واحدة.</p></div><button class="primary-btn">${icons.plus} إنشاء مساحة</button></div><div class="space-tabs"><button class="selected">الكل</button><button>القنوات</button><button>المجتمعات</button></div><div class="space-grid">${channels.map(channel => `<article class="space-card"><div class="space-icon ${channel.color}">${channel.avatar}</div><div><h3>${channel.name}</h3><p>${channel.desc}</p><small>${channel.members} متابع</small></div><button class="follow-btn" data-subscribe="${channel.name}">${state.subscribed.has(channel.name) ? 'تتابع' : 'متابعة'}</button></article>`).join('')}<article class="space-card community-space"><div class="space-icon purple">◈</div><div><h3>تقنية الغد</h3><p>مجتمع للحوار والعمل المشترك.</p><small>4.2K عضو</small></div><button class="follow-btn">انضمام</button></article></div></div>`, 'المساحات', 'استكشف'); }
+function spacesView() {
+  const listedChannels = state.spaceFilter === 'communities' ? [] : displayChannels();
+  const showCommunities = state.spaceFilter !== 'channels';
+  const communityItems = [{ id: 'future-tech', name: 'تقنية الغد', desc: 'مجتمع للحوار والعمل المشترك.', members: '4.2K عضو' }, ...state.userCommunities];
+  return shell(`<div class="spaces-page"><div class="page-heading"><div><span class="eyebrow">مساحة واحدة</span><h2>القنوات والمجتمعات</h2><p>كل مساحاتك في قائمة واحدة.</p></div><button class="primary-btn" data-create-space>${icons.plus} إنشاء قناة</button></div><div class="space-tabs"><button class="${state.spaceFilter === 'all' ? 'selected' : ''}" data-space-filter="all">الكل</button><button class="${state.spaceFilter === 'channels' ? 'selected' : ''}" data-space-filter="channels">القنوات</button><button class="${state.spaceFilter === 'communities' ? 'selected' : ''}" data-space-filter="communities">المجتمعات</button></div><div class="space-grid">${listedChannels.map(channel => `<article class="space-card" data-space-kind="channel"><div class="space-icon ${channel.color}">${escapeHtml(channel.avatar)}</div><div><h3>${escapeHtml(channel.name)}</h3><p>${escapeHtml(channel.desc)}</p><small>${channel.members} رسالة</small></div><button class="follow-btn ${channel.isMember ? 'following' : ''}" data-channel-join="${escapeHtml(channel.id || '')}" ${channel.id ? '' : 'disabled'}>${channel.isMember ? 'مشترك' : 'انضمام'}</button><button class="channel-enter" data-enter-channel="${escapeHtml(channel.id || '')}" ${channel.id && channel.isMember ? '' : 'disabled'}>دخول</button></article>`).join('')}${showCommunities ? communityItems.map(community => `<article class="space-card community-space" data-space-kind="community"><div class="space-icon purple">◈</div><div><h3>${escapeHtml(community.name)}</h3><p>${escapeHtml(community.desc)}</p><small>${escapeHtml(community.members || 'مساحة محلية')}</small></div><button class="follow-btn ${state.joinedSpaces.has(community.id) ? 'following' : ''}" data-join-space="${escapeHtml(community.id)}">${state.joinedSpaces.has(community.id) ? 'انضممت' : 'انضمام'}</button></article>`).join('') : ''}${!listedChannels.length && !showCommunities ? '<p class="explore-empty">لا توجد قنوات بعد.</p>' : ''}</div></div>`, 'المساحات', 'استكشف');
+}
 function moderationView() {
   const items = state.moderationPosts.map(post => {
     const labels = Array.isArray(post.moderationLabels) ? post.moderationLabels.map(label => label.Name).filter(Boolean) : [];
@@ -620,13 +692,28 @@ function moderationView() {
 }
 function profileEditView() { const user = currentUser(); return shell(`<div class="profile-edit-page"><div class="page-heading"><div><span class="eyebrow">ملفك الشخصي</span><h2>عدّل هويتك</h2><p>غيّر الاسم واليوزر والنبذة في أي وقت.</p></div></div><form class="profile-form" data-profile-edit-form><label>الاسم المعروض<input name="displayName" value="${user.displayName || ''}" required minlength="2" maxlength="30" /></label><label>اسم المستخدم<input name="username" value="${user.username || ''}" pattern="${USERNAME_PATTERN.source}" required minlength="3" maxlength="20" /><small class="field-hint">يبدأ بحرف إنجليزي، ثم أحرف أو أرقام أو _</small></label><label>النبذة<textarea name="bio" maxlength="120" placeholder="اكتب نبذة قصيرة">${user.bio || ''}</textarea></label><button class="auth-submit" type="submit">حفظ التغييرات <span>←</span></button></form></div>`, 'الملف الشخصي', 'حسابك'); }
 
+function profileVideoGrid(items, emptyText) {
+  if (!items.length) return `<div class="profile-grid-empty"><span>${icons.studio}</span><p>${emptyText}</p><button class="primary-btn" data-nav="studio">افتح الاستوديو <span>←</span></button></div>`;
+  return items.map((video, index) => `<button class="profile-video-tile" data-profile-video="${escapeHtml(video.postId || video.id)}" style="--tile-hue:${index % 3}"><video src="${escapeHtml(video.src || '')}" muted preload="metadata"></video><span class="tile-gradient"></span><strong>${escapeHtml(video.title || 'فيديو NEXA')}</strong><small>♡ ${state.liked.has(video.postId || video.id) ? 1 : 0} · ${video.views || 'جديد'}</small></button>`).join('');
+}
+
 function profileView() {
   const user = currentUser();
-  const ownVideos = state.userVideos.filter(video => video.authorEmail === user.email);
-  const likedVideos = state.userVideos.filter(video => state.liked.has(video.id));
-  const visibleVideos = ownVideos;
-  const grid = visibleVideos.length ? visibleVideos.map((video, index) => `<button class="profile-video-tile" data-profile-video="${video.id}" style="--tile-hue:${index % 3}"><video src="${video.src}" muted preload="metadata"></video><span class="tile-gradient"></span><strong>${video.title}</strong><small>♡ ${state.liked.has(video.id) ? 1 : 0} · ${video.views || 'جديد'}</small></button>`).join('') : `<div class="profile-grid-empty"><span>${icons.studio}</span><p>لم تنشر فيديوهات بعد.</p><button class="primary-btn" data-nav="studio">إنشاء أول فيديو <span>←</span></button></div>`;
-  return shell(`<div class="profile-page"><section class="profile-hero"><div class="profile-identity">${avatar(user.avatar, user.color, 'profile-avatar')}<div><h2>${user.displayName || user.username} ${verificationBadge(user)}</h2><p>@${user.username}</p><small>${user.bio || 'أهلاً بك في ملفي على NEXA.'}</small></div></div><div class="profile-actions"><button class="profile-edit-trigger" data-profile-edit>${icons.settings}<span>تعديل البروفايل</span></button><button class="share-profile" data-share-profile>${icons.share}<span>مشاركة</span></button></div><div class="profile-stats-row"><button data-profile-stat="followers"><strong>${user.followers || 0}</strong><small>المتابعون</small></button><button data-profile-stat="following"><strong>${state.subscribed.size}</strong><small>يتابع</small></button><button><strong>${likedVideos.length}</strong><small>الإعجابات</small></button></div></section><div class="profile-tabs"><button class="selected">الفيديوهات <b>${ownVideos.length}</b></button><button>المعجب بها</button><button>المحفوظة</button></div><section class="profile-grid">${grid}</section></div>`, 'البروفايل', 'حسابك');
+  const allVideos = [...state.userVideos, ...state.remotePosts];
+  const ownVideos = allVideos.filter(video => video.authorEmail === user.email || video.authorEmail === user.id);
+  const likedVideos = allVideos.filter(video => state.liked.has(video.postId || video.id) || video.liked);
+  const savedVideos = allVideos.filter(video => state.saved.has(video.postId || video.id) || video.saved);
+  const tabs = { videos: ['الفيديوهات', ownVideos], liked: ['المعجب بها', likedVideos], saved: ['المحفوظة', savedVideos] };
+  const [label, selectedVideos] = tabs[state.profileTab] || tabs.videos;
+  const emptyText = state.profileTab === 'liked' ? 'لم تعجبك فيديوهات بعد.' : state.profileTab === 'saved' ? 'لا توجد فيديوهات محفوظة.' : 'لم تنشر فيديوهات بعد.';
+  const grid = profileVideoGrid(selectedVideos, emptyText);
+  return shell(`<div class="profile-page"><section class="profile-hero"><div class="profile-identity">${avatar(user.avatar, user.color, 'profile-avatar')}<div><h2>${user.displayName || user.username} ${verificationBadge(user)}</h2><p>@${user.username}</p><small>${user.bio || 'أهلاً بك في ملفي على NEXA.'}</small></div></div><div class="profile-actions"><button class="profile-edit-trigger" data-profile-edit>${icons.settings}<span>تعديل البروفايل</span></button><button class="share-profile" data-share-profile>${icons.share}<span>مشاركة</span></button></div><div class="profile-stats-row"><button data-profile-stat="followers"><strong>${user.followers || 0}</strong><small>المتابعون</small></button><button data-profile-stat="following"><strong>${state.subscribed.size}</strong><small>يتابع</small></button><button data-profile-stat="liked"><strong>${likedVideos.length}</strong><small>الإعجابات</small></button></div></section><div class="profile-tabs"><button data-profile-tab="videos" class="${state.profileTab === 'videos' ? 'selected' : ''}">الفيديوهات <b>${ownVideos.length}</b></button><button data-profile-tab="liked" class="${state.profileTab === 'liked' ? 'selected' : ''}">المعجب بها <b>${likedVideos.length}</b></button><button data-profile-tab="saved" class="${state.profileTab === 'saved' ? 'selected' : ''}">المحفوظة <b>${savedVideos.length}</b></button></div><section class="profile-grid" aria-label="${label}">${grid}</section></div>`, 'البروفايل', 'حسابك');
+}
+
+function savedView() {
+  const savedVideos = [...state.userVideos, ...state.remotePosts].filter(video => state.saved.has(video.postId || video.id) || video.saved);
+  const content = savedVideos.length ? savedVideos.map(videoCard).join('') : '<div class="stream-empty"><span>▱</span><h2>لا توجد عناصر محفوظة</h2><p>احفظ فيديو من الموجز ليظهر هنا.</p><button class="primary-btn" data-nav="feed">العودة للموجز</button></div>';
+  return shell(`<div class="feed-layout"><section class="feed-column"><div class="stream-list">${content}</div></section></div>`, 'المحفوظات', 'مكتبتك');
 }
 
 function developerView() {
@@ -671,7 +758,7 @@ function render() {
     bindEvents();
     return;
   }
-  const views = { feed: feedView, explore: exploreView, messages: messagesView, studio: studioView, spaces: spacesView, profile: profileView, 'profile-edit': profileEditView, developers: developerAppView, moderation: moderationView };
+  const views = { feed: feedView, explore: exploreView, saved: savedView, messages: messagesView, 'channel-chat': channelChatView, studio: studioView, spaces: spacesView, profile: profileView, 'profile-edit': profileEditView, developers: developerAppView, moderation: moderationView };
   document.querySelector('#app').innerHTML = views[state.active](); bindEvents();
   } catch (error) {
     console.error('NEXA render failed', error);
@@ -680,7 +767,17 @@ function render() {
   }
 }
 function toast(message) { state.toast = message; const el = document.createElement('div'); el.className = 'toast'; el.textContent = message; document.body.appendChild(el); setTimeout(() => el.remove(), 2200); }
-function moderationMessage(error) { return error?.message === 'CONTENT_REJECTED' ? 'تم رفض المحتوى لمخالفته إرشادات NEXA.' : null; }
+function moderationMessage(error) {
+  const messages = {
+    CONTENT_REJECTED: 'تم رفض المحتوى لمخالفته إرشادات NEXA.',
+    CONTENT_REQUIRES_REVIEW: 'تعذر اعتماد المحتوى آليًا؛ أعد صياغته بطريقة أوضح.',
+    CONTENT_TOO_LONG: 'المحتوى أطول من الحد المسموح.',
+    DEEPSEEK_NOT_CONFIGURED: 'فحص المحتوى غير مفعّل على الخادم حاليًا.',
+    AI_MODERATION_UNAVAILABLE: 'فحص المحتوى متوقف مؤقتًا؛ لم يتم نشر المحتوى، حاول لاحقًا.',
+    LINK_NOT_ALLOWED: 'هذا الرابط غير مسموح به.'
+  };
+  return messages[error?.message] || null;
+}
 function escapeHtml(value) { return String(value).replace(/[&<>'"]/g, character => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' }[character])); }
 function setupVideoAutoplay() {
   const stream = document.querySelector('.stream-list');
@@ -700,6 +797,13 @@ function setupVideoAutoplay() {
   if (videosOnPage[0]) startVideo(videosOnPage[0]);
 }
 function bindEvents() {
+  document.querySelectorAll('.dev-toggle.active:not([data-experiment-action])').forEach(button => {
+    const status = document.createElement('span');
+    status.className = button.className;
+    status.setAttribute('role', 'status');
+    status.textContent = button.textContent;
+    button.replaceWith(status);
+  });
   const feedFilters = ['for-you', 'following', 'latest'];
   document.querySelectorAll('.feed-tabs button').forEach((button, index) => {
     button.classList.toggle('selected', feedFilters[index] === state.feedFilter);
@@ -750,6 +854,82 @@ function bindEvents() {
     try { state.explore = await api('/api/explore'); } catch { /* keep the current view available */ }
     render();
   }));
+  document.querySelectorAll('.channel-hero .primary-btn, .channels-page .page-heading .outline-btn').forEach(button => button.addEventListener('click', () => {
+    state.active = 'spaces';
+    state.spaceFilter = 'channels';
+    render();
+  }));
+  document.querySelectorAll('.community-page .page-heading .primary-btn').forEach(button => button.addEventListener('click', async () => {
+    if (!isAuthenticated()) { state.authScreen = 'login'; state.authPrompt = 'سجّل الدخول لإنشاء مجتمع'; render(); return; }
+    const name = window.prompt('اسم المجتمع الجديد');
+    if (!name?.trim()) return;
+    const description = window.prompt('وصف المجتمع (اختياري)') || '';
+    try {
+      const { channel } = await api('/api/channels', { method: 'POST', body: JSON.stringify({ name: name.trim(), description: description.trim() }) });
+      state.userCommunities.push({ id: channel.id, name: channel.name, desc: channel.description, members: 'أنت المؤسس' });
+      persistUserCommunities();
+      state.spaceFilter = 'communities';
+      state.active = 'spaces';
+      render();
+      toast('تم إنشاء المجتمع');
+    } catch (error) { toast(moderationMessage(error) || 'تعذر إنشاء المجتمع.'); }
+  }));
+  document.querySelectorAll('.community-feature .join-btn').forEach(button => button.addEventListener('click', () => {
+    const id = button.dataset.joinSpace || 'future-tech';
+    if (state.joinedSpaces.has(id)) state.joinedSpaces.delete(id);
+    else state.joinedSpaces.add(id);
+    persistJoinedSpaces();
+    render();
+    toast(state.joinedSpaces.has(id) ? 'انضممت إلى المجتمع' : 'غادرت المجتمع');
+  }));
+  document.querySelectorAll('.suggestions .section-heading button').forEach(button => button.addEventListener('click', async () => {
+    button.disabled = true;
+    try { await hydrateBackendContent(); toast('تم تحديث الاقتراحات'); }
+    catch { toast('تعذر تحديث الاقتراحات الآن'); }
+    finally { button.disabled = false; }
+  }));
+  document.querySelectorAll('.visual-more').forEach(button => button.addEventListener('click', async () => {
+    const video = button.closest('.video-card');
+    try {
+      const shareData = { title: 'NEXA', text: video?.querySelector('.video-caption p')?.textContent || 'شاهد هذا الفيديو على NEXA', url: location.href };
+      if (navigator.share) await navigator.share(shareData);
+      else { await navigator.clipboard.writeText(shareData.url); toast('تم نسخ رابط الفيديو'); }
+    } catch (error) { if (error.name !== 'AbortError') toast('تعذرت مشاركة الفيديو'); }
+  }));
+  document.querySelectorAll('.channel-hero .primary-btn, .channels-page .page-heading .outline-btn').forEach(button => button.addEventListener('click', () => {
+    state.active = 'spaces';
+    state.spaceFilter = 'channels';
+    render();
+  }));
+  document.querySelectorAll('.community-page .page-heading .primary-btn').forEach(button => button.addEventListener('click', async () => {
+    if (!isAuthenticated()) { state.authScreen = 'login'; state.authPrompt = 'سجّل الدخول لإنشاء مجتمع'; render(); return; }
+    const name = window.prompt('اسم المجتمع الجديد');
+    if (!name?.trim()) return;
+    const description = window.prompt('وصف المجتمع (اختياري)') || '';
+    try {
+      const { channel } = await api('/api/channels', { method: 'POST', body: JSON.stringify({ name: name.trim(), description: description.trim() }) });
+      state.userCommunities.push({ id: channel.id, name: channel.name, desc: channel.description, members: 'أنت المؤسس' });
+      persistUserCommunities();
+      state.spaceFilter = 'communities';
+      state.active = 'spaces';
+      render();
+      toast('تم إنشاء المجتمع');
+    } catch (error) { toast(moderationMessage(error) || 'تعذر إنشاء المجتمع.'); }
+  }));
+  document.querySelectorAll('.community-feature .join-btn').forEach(button => button.addEventListener('click', () => {
+    const id = button.dataset.joinSpace || 'future-tech';
+    if (state.joinedSpaces.has(id)) state.joinedSpaces.delete(id);
+    else state.joinedSpaces.add(id);
+    persistJoinedSpaces();
+    render();
+    toast(state.joinedSpaces.has(id) ? 'انضممت إلى المجتمع' : 'غادرت المجتمع');
+  }));
+  document.querySelectorAll('.suggestions .section-heading button').forEach(button => button.addEventListener('click', async () => {
+    button.disabled = true;
+    try { await hydrateBackendContent(); toast('تم تحديث الاقتراحات'); }
+    catch { toast('تعذر تحديث الاقتراحات الآن'); }
+    finally { button.disabled = false; }
+  }));
   document.querySelectorAll('[data-local-google]').forEach(button => button.addEventListener('click', () => {
     window.location.assign(`${apiOrigin}/auth/google`);
   }));
@@ -758,7 +938,55 @@ function bindEvents() {
     toast('بوابة المطورين متاحة للحسابات المصرح بها فقط');
   }));
   const integrationForm = document.querySelector('[data-integration-form]');
-  if (integrationForm) integrationForm.addEventListener('submit', event => { event.preventDefault(); localStorage.setItem('nexa-local-integrations', 'configured'); document.querySelector('[data-integration-status]').textContent = 'مفعّل محليًا على هذا المتصفح'; toast('تم حفظ إعدادات الواجهة محليًا'); });
+  if (integrationForm) {
+    const integrationPanel = integrationForm.closest('.integration-panel');
+    integrationPanel.innerHTML = '<div class="section-heading"><h3>تكاملات الخادم</h3><small>تُدار الأسرار عبر متغيرات بيئة الخادم فقط</small></div><ul class="link-audit-list" data-integration-status><li>جارٍ فحص الإعدادات...</li></ul>';
+    api('/api/owner/ai/status').then(status => {
+      integrationPanel.querySelector('[data-integration-status]').innerHTML = `<li>DeepSeek: ${status.enabled ? 'مهيأ' : 'غير مهيأ'}</li><li>Google OAuth: ${status.googleOAuthConfigured ? 'مهيأ' : 'غير مهيأ'}</li>`;
+    }).catch(() => { integrationPanel.querySelector('[data-integration-status]').innerHTML = '<li>تعذر قراءة حالة التكاملات.</li>'; });
+  }
+  const developerPage = document.querySelector('.developer-app-page');
+  if (developerPage && !developerPage.querySelector('[data-link-host-form]')) {
+    const linkPanel = document.createElement('section');
+    linkPanel.className = 'integration-panel';
+    linkPanel.innerHTML = '<div class="section-heading"><h3>سياسة الروابط</h3><small>كل نطاق محظور افتراضيًا؛ السماح يشمل النطاقات الفرعية</small></div><form class="integration-form" data-link-host-form><label>النطاق المسموح<input name="host" placeholder="example.com" autocomplete="off" required /></label><button class="dev-primary" type="submit">إضافة نطاق</button></form><ul class="link-host-list" data-link-host-list><li>جارٍ تحميل القائمة...</li></ul><div class="section-heading"><h3>محاولات مرفوضة</h3></div><ul class="link-audit-list" data-link-audit-list><li>جارٍ تحميل السجل...</li></ul>';
+    developerPage.insertBefore(linkPanel, developerPage.querySelector('.developer-chat'));
+    const hostList = linkPanel.querySelector('[data-link-host-list]');
+    const auditList = linkPanel.querySelector('[data-link-audit-list]');
+    const refreshLinkPolicy = async () => {
+      try {
+        const data = await api('/api/owner/links');
+        hostList.innerHTML = data.hosts.length ? data.hosts.map(host => `<li><code>${escapeHtml(host)}</code><button class="dev-outline" data-remove-link-host="${escapeHtml(host)}" aria-label="حذف ${escapeHtml(host)}">حذف</button></li>`).join('') : '<li>لا توجد نطاقات مسموحة.</li>';
+        auditList.innerHTML = data.blockedAttempts.length ? data.blockedAttempts.map(item => `<li>${escapeHtml(new Date(item.createdAt).toLocaleString())} · ${escapeHtml(item.reason)}</li>`).join('') : '<li>لا توجد محاولات مسجلة.</li>';
+      } catch {
+        hostList.innerHTML = '<li>تعذر تحميل سياسة الروابط.</li>';
+        auditList.innerHTML = '<li>تعذر تحميل السجل.</li>';
+      }
+    };
+    linkPanel.querySelector('[data-link-host-form]').addEventListener('submit', async event => {
+      event.preventDefault();
+      const form = event.currentTarget;
+      const host = form.elements.host.value.trim();
+      try {
+        await api('/api/owner/links', { method: 'POST', body: JSON.stringify({ host }) });
+        form.reset();
+        await refreshLinkPolicy();
+        toast('تم تحديث قائمة الروابط المسموحة');
+      } catch (error) {
+        toast(error.message === 'INVALID_LINK_HOST' ? 'أدخل اسم نطاق صالحًا مثل example.com.' : 'تعذر تحديث قائمة الروابط.');
+      }
+    });
+    hostList.addEventListener('click', async event => {
+      const button = event.target.closest('[data-remove-link-host]');
+      if (!button) return;
+      try {
+        await api(`/api/owner/links/${encodeURIComponent(button.dataset.removeLinkHost)}`, { method: 'DELETE' });
+        await refreshLinkPolicy();
+        toast('تم حذف النطاق من القائمة');
+      } catch { toast('تعذر حذف النطاق.'); }
+    });
+    refreshLinkPolicy();
+  }
   const experimentForm = document.querySelector('[data-experiment-form]');
   const experimentList = document.querySelector('[data-experiment-list]');
   if (experimentForm) experimentForm.addEventListener('submit', event => { event.preventDefault(); const values = Object.fromEntries(new FormData(experimentForm)); experimentList.insertAdjacentHTML('beforeend', `<article class="experiment-row"><div><strong>${escapeHtml(values.name)}</strong><small>${escapeHtml(values.description || '')}</small><b>draft</b></div><div><button class="dev-toggle active" data-experiment-action="activate">تفعيل</button><button class="dev-outline" data-experiment-action="cancel">إلغاء</button></div></article>`); experimentForm.reset(); toast('تم إنشاء تجربة محلية'); });
@@ -778,12 +1006,60 @@ function bindEvents() {
   document.querySelectorAll('[data-copy-dev-link]').forEach(button => button.addEventListener('click', async () => { try { await navigator.clipboard.writeText(`${location.origin}/dev`); toast('تم نسخ رابط المطورين'); } catch { toast(`${location.origin}/dev`); } }));
   document.querySelectorAll('[data-dev-action]').forEach(button => button.addEventListener('click', () => { toast('أرسل طلبك إلى البوس من بوابة API الخاصة بالمطورين.'); }));
   document.querySelectorAll('[data-dev-login]').forEach(button => button.addEventListener('click', () => { state.authScreen = 'login'; state.authPrompt = 'سجّل الدخول للمطالبة ببوابة المطورين'; window.history.replaceState({}, '', '/'); render(); }));
+  document.querySelectorAll('[data-experiment-action]').forEach(button => button.addEventListener('click', () => {
+    const row = button.closest('.experiment-row');
+    if (!row) return;
+    if (button.dataset.experimentAction === 'cancel') { row.remove(); toast('تم إلغاء التجربة'); return; }
+    const status = row.querySelector('b');
+    if (status) status.textContent = 'active';
+    button.disabled = true;
+    toast('تم تفعيل التجربة محليًا');
+  }));
   const studioPanel = document.querySelector('.studio-panel');
   const studioNotice = document.querySelector('.studio-note p');
   if (studioNotice) studioNotice.innerHTML = '<strong>فحص محلي أساسي</strong><br />قواعد كلمات تعمل دون اتصال، وليست نموذج ذكاء اصطناعي.';
   if (studioPanel && !document.querySelector('#video-upload')) {
     studioPanel.insertAdjacentHTML('beforeend', '<div class="upload-control"><input id="video-upload" type="file" accept="video/*" hidden /><button type="button" data-upload-video disabled>رفع فيديو من جهازك <span>↑</span></button><label class="media-consent"><input id="media-moderation-consent" type="checkbox" /> أوافق على فحص الفيديو آليًا؛ عند تفعيل التكامل يُرسل إلى AWS، وتظل الوسائط مخفية حتى اجتياز الفحص أو مراجعة المشرف.</label><small>تتطلب الملفات غير المدعومة أو نتيجة الفحص المشكوك فيها مراجعة بشرية.</small></div>');
   }
+  document.querySelectorAll('.mode-switch button').forEach(button => button.addEventListener('click', () => {
+    const mode = button.textContent.trim();
+    if (mode !== 'فيديو') { toast('وضع الصور والبث المباشر غير متاحين بعد؛ تصوير الفيديو يعمل الآن.'); return; }
+    document.querySelectorAll('.mode-switch button').forEach(item => item.classList.toggle('selected', item === button));
+    state.studioMode = 'video';
+  }));
+  const studioFilters = ['none', 'contrast(1.15) saturate(1.25)', 'grayscale(.35)', 'sepia(.28)', 'hue-rotate(24deg)', 'brightness(1.08) saturate(.85)'];
+  document.querySelectorAll('.effects-grid .effect').forEach((button, index) => button.addEventListener('click', () => {
+    state.studioEffect = index;
+    document.querySelectorAll('.effects-grid .effect').forEach((item, itemIndex) => item.classList.toggle('selected', itemIndex === index));
+    const preview = document.querySelector('.camera-preview');
+    if (preview) preview.style.filter = studioFilters[index] || 'none';
+    toast(index ? 'طُبق التأثير على معاينة الكاميرا' : 'أزيل التأثير');
+  }));
+  document.querySelectorAll('.studio-control').forEach((button, index) => button.addEventListener('click', async () => {
+    if (index === 0) {
+      state.studioFrameRate = state.studioFrameRate === 24 ? 30 : state.studioFrameRate === 30 ? 60 : 24;
+      button.querySelector('small').textContent = `${state.studioFrameRate} FPS`;
+      const track = state.cameraStream?.getVideoTracks()[0];
+      try { if (track) await track.applyConstraints({ frameRate: { ideal: state.studioFrameRate, max: state.studioFrameRate } }); }
+      catch { toast('لم يدعم الجهاز معدل الإطارات المختار'); }
+      if (!track) toast(`سيبدأ التصوير القادم بمعدل ${state.studioFrameRate} إطارًا/ثانية`);
+      return;
+    }
+    state.studioEffect = (state.studioEffect + 1) % studioFilters.length;
+    const preview = document.querySelector('.camera-preview');
+    if (preview) preview.style.filter = studioFilters[state.studioEffect];
+    document.querySelectorAll('.effects-grid .effect').forEach((item, itemIndex) => item.classList.toggle('selected', itemIndex === state.studioEffect));
+    toast('تم تغيير تأثير معاينة الكاميرا');
+  }));
+  document.querySelector('.studio-panel .panel-head .icon-btn')?.addEventListener('click', () => {
+    const consent = document.querySelector('#media-moderation-consent');
+    if (consent) { consent.closest('label')?.scrollIntoView({ behavior: 'smooth', block: 'center' }); consent.focus(); }
+    else toast('إعدادات التصوير تظهر عند اختيار فيديو في الاستوديو.');
+  });
+  document.querySelector('.effects-title button')?.addEventListener('click', () => {
+    document.querySelector('.effects-grid .effect')?.focus();
+    toast('كل التأثيرات المتاحة ظاهرة هنا.');
+  });
   const moderationDisclaimer = document.createElement('small');
   moderationDisclaimer.className = 'local-moderation-note';
   moderationDisclaimer.textContent = 'الفحص المحلي يراجع النص فقط، ولا يحلل صورة الفيديو أو صوته. المراجعة السحابية تحتاج اتصالًا.';
@@ -801,12 +1077,13 @@ function bindEvents() {
     if (!mediaConsent?.checked) { toast('وافق على فحص الفيديو قبل بدء التصوير'); return; }
     if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) { toast('التصوير غير مدعوم في هذا المتصفح؛ استخدم رفع فيديو'); return; }
     try {
-      state.cameraStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: { facingMode: 'user' } });
+      state.cameraStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: { facingMode: 'user', frameRate: { ideal: state.studioFrameRate, max: state.studioFrameRate } } });
       const preview = document.createElement('video');
       preview.className = 'camera-preview';
       preview.autoplay = true;
       preview.muted = true;
       preview.playsInline = true;
+      preview.style.filter = studioFilters[state.studioEffect] || 'none';
       preview.srcObject = state.cameraStream;
       document.querySelector('.camera-frame')?.prepend(preview);
       const supportedType = ['video/webm;codecs=vp8,opus', 'video/webm'].find(type => MediaRecorder.isTypeSupported(type));
@@ -847,7 +1124,94 @@ function bindEvents() {
   document.querySelectorAll('[data-auth-screen]').forEach(el => el.addEventListener('click', () => { state.authScreen = el.dataset.authScreen; state.authPrompt = ''; state.authError = ''; render(); }));
   document.querySelectorAll('[data-profile-edit]').forEach(el => el.addEventListener('click', () => { if (!isAuthenticated()) { state.authScreen = 'login'; state.authPrompt = 'سجّل الدخول لتعديل ملفك'; render(); return; } state.active = 'profile-edit'; render(); }));
   document.querySelectorAll('[data-share-profile]').forEach(el => el.addEventListener('click', async () => { const link = `${location.origin}/profile/${currentUser().username}`; try { await navigator.clipboard.writeText(link); toast('تم نسخ رابط البروفايل'); } catch { toast(link); } }));
-  document.querySelectorAll('[data-profile-video]').forEach(el => el.addEventListener('click', () => { const video = state.userVideos.find(item => item.id === el.dataset.profileVideo); if (!video) return; state.userVideos = [video, ...state.userVideos.filter(item => item.id !== video.id)]; state.active = 'feed'; render(); }));
+  document.querySelectorAll('[data-profile-tab]').forEach(button => button.addEventListener('click', () => { state.profileTab = button.dataset.profileTab; render(); }));
+  document.querySelectorAll('[data-profile-stat]').forEach(button => button.addEventListener('click', () => {
+    if (button.dataset.profileStat === 'liked') { state.profileTab = 'liked'; render(); return; }
+    const count = button.dataset.profileStat === 'following' ? state.subscribed.size : Number(currentUser().followers || 0);
+    toast(count ? `${count} ${button.dataset.profileStat === 'following' ? 'حساب تتابعه' : 'متابع'}` : 'لا توجد حسابات هنا بعد.');
+  }));
+  document.querySelectorAll('[data-profile-video]').forEach(el => el.addEventListener('click', () => {
+    const id = el.dataset.profileVideo;
+    const localVideo = state.userVideos.find(item => (item.postId || item.id) === id);
+    const remoteVideo = state.remotePosts.find(item => (item.postId || item.id) === id);
+    if (localVideo) state.userVideos = [localVideo, ...state.userVideos.filter(item => item !== localVideo)];
+    if (remoteVideo) state.remotePosts = [remoteVideo, ...state.remotePosts.filter(item => item !== remoteVideo)];
+    if (!localVideo && !remoteVideo) return;
+    state.active = 'feed';
+    render();
+  }));
+  document.querySelectorAll('[data-space-filter]').forEach(button => button.addEventListener('click', () => {
+    state.spaceFilter = button.dataset.spaceFilter;
+    render();
+  }));
+  document.querySelectorAll('[data-create-space]').forEach(button => button.addEventListener('click', async () => {
+    if (!isAuthenticated()) { state.authScreen = 'login'; state.authPrompt = 'سجّل الدخول لإنشاء قناة'; render(); return; }
+    const name = window.prompt('اسم القناة الجديدة');
+    if (!name?.trim()) return;
+    const description = window.prompt('وصف القناة (اختياري)') || '';
+    try {
+      await api('/api/channels', { method: 'POST', body: JSON.stringify({ name: name.trim(), description: description.trim() }) });
+      state.remoteChannels = (await api('/api/channels')).channels || [];
+      state.spaceFilter = 'channels';
+      render();
+      toast('تم إنشاء القناة');
+    } catch (error) { toast(moderationMessage(error) || 'تعذر إنشاء القناة.'); }
+  }));
+  document.querySelectorAll('[data-join-space]').forEach(button => button.addEventListener('click', () => {
+    const id = button.dataset.joinSpace;
+    if (state.joinedSpaces.has(id)) state.joinedSpaces.delete(id);
+    else state.joinedSpaces.add(id);
+    persistJoinedSpaces();
+    render();
+    toast(state.joinedSpaces.has(id) ? 'انضممت إلى المجتمع على هذا الجهاز' : 'غادرت المجتمع');
+  }));
+  document.querySelectorAll('[data-subscribe]').forEach(button => button.addEventListener('click', () => {
+    if (!isAuthenticated()) { state.authScreen = 'login'; state.authPrompt = 'سجّل الدخول لمتابعة القنوات'; render(); return; }
+    const id = button.dataset.subscribe;
+    if (state.subscribed.has(id)) state.subscribed.delete(id);
+    else state.subscribed.add(id);
+    persistFollowing();
+    render();
+    toast(state.subscribed.has(id) ? 'تمت المتابعة' : 'ألغيت المتابعة');
+  }));
+  document.querySelectorAll('[data-channel-join]').forEach(button => button.addEventListener('click', async () => {
+    if (!isAuthenticated()) { state.authScreen = 'login'; state.authPrompt = 'سجّل الدخول للانضمام إلى القناة'; render(); return; }
+    const channel = state.remoteChannels.find(item => item.id === button.dataset.channelJoin);
+    if (!channel) { toast('هذه قناة تجريبية؛ أنشئ قناة فعلية أو حدّث القائمة.'); return; }
+    const method = channel.isMember ? 'DELETE' : 'POST';
+    try {
+      await api(`/api/channels/${encodeURIComponent(channel.id)}/${channel.isMember ? 'leave' : 'join'}`, { method, body: JSON.stringify({}) });
+      state.remoteChannels = (await api('/api/channels')).channels || [];
+      render();
+      toast(method === 'POST' ? 'انضممت إلى القناة' : 'غادرت القناة');
+    } catch (error) { toast(error.message === 'CHANNEL_PRIVATE' ? 'هذه القناة خاصة.' : 'تعذر تحديث عضوية القناة.'); }
+  }));
+  document.querySelectorAll('[data-enter-channel]').forEach(button => button.addEventListener('click', async () => {
+    if (!isAuthenticated()) { state.authScreen = 'login'; state.authPrompt = 'سجّل الدخول لدخول القناة'; render(); return; }
+    const channel = state.remoteChannels.find(item => item.id === button.dataset.enterChannel);
+    if (!channel) { toast('القناة غير موجودة. حدّث قائمة المساحات.'); return; }
+    try {
+      if (!channel.isMember) await api(`/api/channels/${encodeURIComponent(channel.id)}/join`, { method: 'POST', body: JSON.stringify({}) });
+      const result = await api(`/api/messages?channelId=${encodeURIComponent(channel.id)}`);
+      state.activeChannelId = channel.id;
+      state.channelMessages = result.messages || [];
+      if (!channel.isMember) state.remoteChannels = (await api('/api/channels')).channels || [];
+      state.active = 'channel-chat';
+      render();
+    } catch (error) { toast(error.message === 'CHANNEL_PRIVATE' ? 'هذه القناة خاصة.' : 'تعذر فتح القناة.'); }
+  }));
+  const channelComposer = document.querySelector('[data-channel-composer]');
+  if (channelComposer) channelComposer.addEventListener('submit', async event => {
+    event.preventDefault();
+    const input = channelComposer.elements.body;
+    const body = input.value.trim();
+    if (!body) return;
+    try {
+      const result = await api('/api/messages', { method: 'POST', body: JSON.stringify({ channelId: state.activeChannelId, body }) });
+      state.channelMessages.push({ ...result.message, sender: { id: state.activeUser.id, displayName: state.activeUser.displayName, username: state.activeUser.username } });
+      render();
+    } catch (error) { toast(moderationMessage(error) || 'تعذر إرسال الرسالة للقناة.'); }
+  });
   document.querySelectorAll('[data-toggle-password]').forEach(el => el.addEventListener('click', () => { const input = el.parentElement.querySelector('input'); input.type = input.type === 'password' ? 'text' : 'password'; el.textContent = input.type === 'password' ? 'إظهار' : 'إخفاء'; }));
   document.querySelectorAll('[data-bell-button]').forEach(button => button.addEventListener('click', async () => {
     if (!isAuthenticated()) { state.authScreen = 'login'; state.authPrompt = 'سجّل الدخول لعرض إشعاراتك'; render(); return; }
@@ -892,13 +1256,15 @@ function bindEvents() {
         render();
         return;
       }
-      state.activeUser = { ...result.user, avatar: (result.user.displayName || result.user.email).slice(0, 1).toUpperCase(), color: 'blue', profileSetup: true };
-      state.pendingUser = state.activeUser;
+      const needsProfileSetup = result.user.profileSetup === false || result.user.status === 'needs_profile_setup';
+      state.activeUser = { ...result.user, avatar: (result.user.displayName || result.user.email).slice(0, 1).toUpperCase(), color: 'blue', profileSetup: !needsProfileSetup };
+      state.pendingUser = needsProfileSetup ? state.activeUser : null;
       state.deviceTrusted = true;
       state.authLoading = false;
-      state.authScreen = 'guest';
+      state.authScreen = needsProfileSetup ? 'forced-profile' : 'guest';
       state.active = 'feed';
       persistAuth();
+      if (needsProfileSetup) { render(); return; }
       await hydrateBackendContent();
       await syncOfflineActions();
       render();
@@ -921,6 +1287,25 @@ function bindEvents() {
   }));
   const profileSetupForm = document.querySelector('[data-profile-setup]'); if (profileSetupForm) profileSetupForm.addEventListener('submit', event => { event.preventDefault(); saveProfileForm(profileSetupForm); });
   const profileEditForm = document.querySelector('[data-profile-edit-form]'); if (profileEditForm) profileEditForm.addEventListener('submit', event => { event.preventDefault(); saveProfileForm(profileEditForm); });
+  const profilePage = document.querySelector('.profile-page');
+  if (profilePage && isAuthenticated()) {
+    const preferences = document.createElement('section');
+    preferences.className = 'integration-panel email-notification-preference';
+    preferences.innerHTML = `<label class="check-label"><input type="checkbox" data-email-notifications ${state.activeUser.notificationsEnabled !== false ? 'checked' : ''} /> إرسال تنبيهات NEXA إلى بريدي</label><small>نرسل إشعارًا عند الرسائل الجديدة وبعض أنشطة الحساب، ولا نضع نص الرسائل الخاصة في البريد.</small>`;
+    profilePage.append(preferences);
+    preferences.querySelector('[data-email-notifications]').addEventListener('change', async event => {
+      const enabled = event.currentTarget.checked;
+      try {
+        await api('/api/me/settings', { method: 'PATCH', body: JSON.stringify({ notificationsEnabled: enabled }) });
+        state.activeUser.notificationsEnabled = enabled;
+        persistAuth();
+        toast(enabled ? 'تم تفعيل تنبيهات البريد' : 'تم إيقاف تنبيهات البريد');
+      } catch {
+        event.currentTarget.checked = !enabled;
+        toast('تعذر تحديث إعداد البريد.');
+      }
+    });
+  }
   document.querySelectorAll('[data-bind-device]').forEach(el => el.addEventListener('click', () => { state.authLoading = true; render(); setTimeout(() => { state.activeUser = state.pendingUser; state.accounts = [...new Map([...state.accounts, state.activeUser].map(user => [user.email, user])).values()]; state.deviceTrusted = true; state.authLoading = false; state.authScreen = state.activeUser.profileSetup === false ? 'forced-profile' : 'guest'; persistAuth(); render(); toast('تم توثيق الجهاز وفتح NEXA'); }, 450); }));
   document.querySelectorAll('[data-add-account]').forEach(el => el.addEventListener('click', () => { state.authScreen = 'login'; state.activeUser = null; state.deviceTrusted = false; state.pendingUser = null; render(); }));
   document.querySelectorAll('[data-switch-account]').forEach(el => el.addEventListener('click', () => { if (state.accounts.length < 2) { toast('أضف حساباً آخر أولاً'); return; } const index = state.accounts.findIndex(user => user.email === state.activeUser.email); state.activeUser = state.accounts[(index + 1) % state.accounts.length]; persistAuth(); render(); toast(`تم التبديل إلى ${state.activeUser.username}`); }));
@@ -940,7 +1325,6 @@ function bindEvents() {
     }
   }));
   document.querySelectorAll('[data-follow-person]').forEach(el => el.addEventListener('click', async () => { if (!isAuthenticated()) { state.authScreen = 'login'; render(); return; } try { const { following } = await api(`/api/users/${el.dataset.followPerson}/follow`, { method: 'POST' }); following ? state.subscribed.add(el.dataset.followPerson) : state.subscribed.delete(el.dataset.followPerson); persistFollowing(); toast(following ? 'تمت متابعة الشخص' : 'تم إلغاء المتابعة'); render(); } catch { toast('تعذر تحديث المتابعة'); } }));
-  document.querySelectorAll('[data-subscribe]').forEach(el => el.addEventListener('click', () => toast('تحتاج القنوات إلى ربط مالكها بحساب المستخدم أولًا')));
   document.querySelectorAll('[data-play]').forEach(el => el.addEventListener('click', event => { event.stopPropagation(); const video = document.querySelector(`[data-video="${el.dataset.play}"]`); if (!video) return; if (video.paused) video.play().catch(() => {}); else video.pause(); }));
   document.querySelectorAll('[data-auth-action]').forEach(el => el.addEventListener('click', () => { if (!isAuthenticated()) { state.authScreen = 'login'; state.authPrompt = 'سجّل الدخول للتفاعل مع الفيديو'; render(); } }));
   document.querySelectorAll('[data-chat]').forEach(el => {
@@ -950,6 +1334,45 @@ function bindEvents() {
       render();
     });
   });
+  const messageSearch = document.querySelector('[data-message-search]');
+  const applyMessageFilters = () => {
+    const query = String(messageSearch?.value || '').trim().toLocaleLowerCase();
+    const unreadSenders = new Set(state.notifications.filter(item => item.type === 'message' && !item.readAt).map(item => item.payload?.actorId));
+    const rows = [...document.querySelectorAll('.chat-row')];
+    rows.forEach(row => {
+      const matchesQuery = row.textContent.toLocaleLowerCase().includes(query);
+      const matchesFilter = state.messageFilter === 'all' || (state.messageFilter === 'unread' && unreadSenders.has(row.dataset.chat));
+      row.hidden = !matchesQuery || !matchesFilter;
+    });
+    const empty = document.querySelector('[data-chat-list-empty]');
+    if (empty) {
+      const visible = rows.some(row => !row.hidden);
+      empty.hidden = visible;
+      empty.textContent = state.messageFilter === 'groups' ? 'لا توجد مجموعات في حسابك بعد.' : query ? 'لا توجد محادثات تطابق بحثك.' : 'لا توجد محادثات في هذا التبويب.';
+    }
+  };
+  messageSearch?.addEventListener('input', applyMessageFilters);
+  applyMessageFilters();
+  document.querySelectorAll('[data-message-filter]').forEach(button => button.addEventListener('click', () => {
+    state.messageFilter = button.dataset.messageFilter;
+    document.querySelectorAll('[data-message-filter]').forEach(tab => tab.classList.toggle('selected', tab === button));
+    applyMessageFilters();
+  }));
+  document.querySelector('[data-new-chat]')?.addEventListener('click', async () => {
+    if (!state.conversationUsers.length) await hydrateBackendMessages();
+    messageSearch?.focus();
+    toast(state.conversationUsers.length ? 'ابحث عن شخص ثم اختره لبدء المحادثة.' : 'لا يوجد مستخدمون آخرون لبدء محادثة معهم بعد.');
+  });
+  document.querySelectorAll('[data-chat-action="search"]').forEach(button => button.addEventListener('click', () => document.querySelector('#message-input')?.focus()));
+  document.querySelectorAll('[data-chat-action="details"]').forEach(button => button.addEventListener('click', () => toast(`محادثة مع ${state.conversationUsers.find(item => item.userId === state.selectedRecipientId)?.name || 'المستخدم'}`)));
+  document.querySelector('[data-insert-emoji]')?.addEventListener('click', () => {
+    const input = document.querySelector('#message-input');
+    if (!input) return;
+    const start = input.selectionStart ?? input.value.length;
+    const end = input.selectionEnd ?? start;
+    input.setRangeText('🙂', start, end, 'end');
+    input.focus();
+  });
   const pendingStreamList = document.querySelector('.stream-list');
   if (pendingStreamList) {
     const pendingVideos = state.offlineActions.filter(action => action.type === 'video' && action.userId === state.activeUser?.id);
@@ -957,7 +1380,7 @@ function bindEvents() {
       pendingStreamList.insertAdjacentHTML('afterbegin', pendingVideos.map(action => `<article class="offline-video-item"><strong>فيديو محفوظ على هذا الجهاز</strong><small>${escapeHtml(action.file.name)}</small><small>${action.status === 'needs-review' ? 'تعذرت المزامنة؛ احذف العنصر أو أعد المحاولة لاحقًا.' : 'سينشر بعد عودة الاتصال.'}</small><button class="offline-remove" data-remove-offline="${escapeHtml(action.id)}">حذف</button></article>`).join(''));
     }
   }
-  const form = document.querySelector('.composer'); if (form) form.addEventListener('submit', async event => {
+  const form = document.querySelector('.composer:not([data-channel-composer])'); if (form) form.addEventListener('submit', async event => {
     event.preventDefault();
     const input = document.querySelector('#message-input');
     const text = input.value.trim();
