@@ -171,6 +171,23 @@ test('DeepSeek moderation runs server-side before storing text and caches low-co
   assert.match(moderation, /defamation[\s\S]*incitement[\s\S]*sexual_content/);
 });
 
+test('settings entry points open a responsive, functional display and eye-comfort settings screen', () => {
+  const app = fs.readFileSync(new URL('../src/main.js', import.meta.url), 'utf8');
+  const styles = fs.readFileSync(new URL('../src/brand-refresh.css', import.meta.url), 'utf8');
+  assert.match(app, /function settingsView\(\)/);
+  assert.match(app, /settings: settingsView/);
+  assert.match(app, /\['settings', icons\.settings, 'الإعدادات'\]/);
+  assert.match(app, /data-nav="settings" aria-label="الإعدادات"/);
+  assert.match(app, /data-preference="eye-comfort"/);
+  assert.match(app, /data-preference="reduce-motion"/);
+  assert.match(app, /data-preference="text-scale"/);
+  assert.match(app, /api\('\/api\/me\/settings'\).*theme: state\.uiTheme/);
+  assert.match(styles, /html\[data-theme="light"\]/);
+  assert.match(styles, /data-eye-comfort="true"/);
+  assert.match(styles, /data-reduce-motion="true"/);
+  assert.match(styles, /@media \(max-width: 800px\)[\s\S]*?overflow-x: auto/);
+});
+
 test('owner link policies are server-authorized and applied to submitted text', () => {
   assert.match(server, /url\.pathname === '\/api\/owner\/links'[\s\S]*?user\.role !== 'owner'/);
   assert.match(server, /ownerLinkRoute[\s\S]*?user\.role !== 'owner'[\s\S]*?redis\.srem/);

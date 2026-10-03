@@ -111,6 +111,22 @@ const state = {
   recordingTimeout: null
 };
 
+const allowedThemes = ['dark', 'light'];
+state.uiTheme = allowedThemes.includes(readLocalValue('nexa-theme')) ? readLocalValue('nexa-theme') : 'dark';
+state.eyeComfort = readLocalValue('nexa-eye-comfort') === 'true';
+state.motionReduced = readLocalValue('nexa-reduced-motion') === 'true';
+state.textScale = ['compact', 'normal', 'large'].includes(readLocalValue('nexa-text-scale')) ? readLocalValue('nexa-text-scale') : 'normal';
+
+function applyDisplayPreferences() {
+  const root = document.documentElement;
+  root.dataset.theme = state.uiTheme;
+  root.dataset.eyeComfort = String(state.eyeComfort);
+  root.dataset.textScale = state.textScale;
+  root.dataset.reduceMotion = String(state.motionReduced);
+}
+
+applyDisplayPreferences();
+
 const apiOrigin = '';
 const oauthErrorMessages = {
   GOOGLE_OAUTH_NOT_CONFIGURED: 'تسجيل Google غير مفعّل بعد. أضف بيانات OAuth الصحيحة إلى إعدادات الخادم.',
@@ -398,12 +414,15 @@ async function hydrateBackendSession() {
       developerStatus: 'pending',
       provider: profile.provider,
       status: profile.status || 'active',
-      notificationsEnabled: profile.notificationsEnabled !== false
+      notificationsEnabled: profile.notificationsEnabled !== false,
+      theme: profile.theme || 'dark'
     };
     const existingIndex = state.users.findIndex(item => item.email === user.email);
     if (existingIndex >= 0) state.users[existingIndex] = { ...state.users[existingIndex], ...user };
     else state.users.push(user);
     state.activeUser = state.users[existingIndex >= 0 ? existingIndex : state.users.length - 1];
+    if (allowedThemes.includes(state.activeUser.theme)) state.uiTheme = state.activeUser.theme;
+    applyDisplayPreferences();
     state.pendingUser = needsProfileSetup ? state.activeUser : null;
     state.accounts = [...new Map([...state.accounts, state.activeUser].map(item => [item.email, item])).values()];
     state.deviceTrusted = true;
@@ -589,7 +608,8 @@ function discoverableUsers() {
 
 const navItems = [
   ['feed', icons.feed, 'الرئيسية'], ['explore', icons.search, 'استكشف'], ['messages', icons.messages, 'الرسائل'],
-  ['studio', icons.studio, 'إنشاء'], ['spaces', icons.communities, 'المساحات'], ['profile', icons.settings, 'بروفايل']
+  ['studio', icons.studio, 'إنشاء'], ['spaces', icons.communities, 'المساحات'], ['profile', '◉', 'حسابي'],
+  ['settings', icons.settings, 'الإعدادات']
 ];
 
 const videos = [];
@@ -608,7 +628,12 @@ function displayChannels() {
 }
 
 function avatar(letter, color, size = '') { return `<span class="avatar ${color} ${size}">${letter}</span>`; }
-function nav() { const items = [...navItems, ['developers', icons.settings, 'صفحة المطورين']]; if (['owner', 'moderator'].includes(state.activeUser?.role)) items.push(['moderation', icons.shield, 'مراجعة المحتوى']); return items.map(([id, icon, label]) => `<button class="nav-item ${state.active === id ? 'active' : ''}" data-nav="${id}" ${id !== 'feed' ? 'data-requires-auth' : ''}><span class="nav-icon">${icon}</span><span>${label}</span>${id === 'messages' && state.unreadNotifications ? `<b class="nav-badge">${Math.min(state.unreadNotifications, 9)}</b>` : ''}</button>`).join(''); }
+function nav() {
+  const items = [...navItems];
+  if (state.serverOwner) items.push(['developers', icons.shield, 'المطورين']);
+  if (['owner', 'moderator'].includes(state.activeUser?.role)) items.push(['moderation', icons.shield, 'مراجعة']);
+  return items.map(([id, icon, label]) => `<button class="nav-item ${state.active === id ? 'active' : ''}" data-nav="${id}" ${(id !== 'feed' && id !== 'explore' && id !== 'settings') ? 'data-requires-auth' : ''}><span class="nav-icon">${icon}</span><span>${label}</span>${id === 'messages' && state.unreadNotifications ? `<b class="nav-badge">${Math.min(state.unreadNotifications, 9)}</b>` : ''}</button>`).join('');
+}
 
 function authShell(content) { return `<div class="auth-shell"><div class="auth-art"><div class="auth-orbit orbit-one"></div><div class="auth-orbit orbit-two"></div><span class="auth-n">N</span><div class="auth-art-copy"><span class="eyebrow">NEXA / SOCIAL OS</span><h1>كل عالمك.<br /><em>في مكان واحد.</em></h1><p>فيديوهات، محادثات، مجتمعات وصوتك الخاص.</p></div></div><main class="auth-panel"><div class="auth-brand"><span class="brand-mark">N</span><strong>NEXA</strong></div>${content}<small class="auth-footer">بالاستمرار، أنت توافق على شروط الاستخدام وسياسة الخصوصية.</small></main></div>`; }
 
@@ -625,8 +650,7 @@ function deviceBindView() { const user = state.pendingUser || currentUser(); ret
 function shell(content, title, eyebrow = '') {
   const user = currentUser();
   const guest = !isAuthenticated();
-    return `<div class="app-shell"><aside class="sidebar"><div class="brand"><button class="brand-mark" data-logo-trigger aria-label="NEXA">N</button><span>NEXA</span></div><div class="profile-mini">${avatar(user.avatar, user.color)}<div><strong>${guest ? 'زائر NEXA' : `${user.displayName || user.username} ${verificationBadge(user)}`}</strong><small>${guest ? 'شاهد بدون حساب' : `@${user.username}`}</small></div><span class="status-dot"></span></div><nav class="primary-nav"><small class="nav-label">${guest ? 'تصفح كزائر' : 'المساحة الشخصية'}</small>${nav()}<small class="nav-label space">استكشف أكثر</small><button class="nav-item"><span class="nav-icon">${icons.search}</span><span>بحث عالمي</span></button><button class="nav-item"><span class="nav-icon">${icons.bookmark}</span><span>المحفوظات</span></button></nav><div class="sidebar-bottom">${guest ? '<button class="guest-login" data-auth-screen="login">تسجيل الدخول <span>←</span></button>' : `<div class="trust"><span>${icons.shield}</span><div><strong>حساب موثوق</strong><small>TrustScore 94%</small></div></div><button class="nav-item" data-add-account><span class="nav-icon">${icons.plus}</span><span>إضافة حساب</span></button><button class="nav-item" data-switch-account><span class="nav-icon">${icons.settings}</span><span>تبديل الحساب</span></button>`}</div></aside><main class="main"><header class="topbar"><div><span class="eyebrow">${eyebrow}</span><h1>${title}</h1></div><div class="top-actions"><button class="icon-btn" data-bell-button aria-label="الإشعارات">${icons.bell}${state.unreadNotifications ? `<i class="notification-count">${Math.min(state.unreadNotifications, 9)}</i>` : ''}</button><button class="create-btn" data-nav="studio"><span>${icons.plus}</span> إنشاء</button>${guest ? '<button class="header-login" data-auth-screen="login">دخول</button>' : `<button class="profile-edit-trigger" data-profile-edit aria-label="تعديل البروفايل">${icons.settings}<span>تعديل البروفايل</span></button><button class="logout-btn" data-logout type="button">تسجيل الخروج</button>${avatar(user.avatar, user.color)}`}</div></header>${content}</main><aside class="right-rail"><section class="rail-card profile-card"><div class="cover"></div><div class="profile-card-body">${avatar(user.avatar, user.color, 'large')}<button class="edit-btn" data-profile-edit>${guest ? 'إنشاء ملفك' : 'تعديل الملف'}</button><h3>${guest ? 'زائر NEXA' : `${user.displayName || user.username} ${verificationBadge(user)}`}</h3><p>${guest ? 'سجّل لتخصيص تجربتك' : `@${user.username}`}</p><div class="profile-stats"><span><b>${user.followers || 0}</b>متابع</span><span><b>0</b>يتابع</span><span><b>${state.userVideos.length}</b>منشور</span></div></div></section><section class="rail-section trends"><div class="section-heading"><h3>ابدأ رحلتك</h3></div><p>${guest ? 'شاهد الفيديوهات الآن، وسجّل للحفظ والتعليق والنشر.' : 'أنشئ أول فيديو وشاركه مع مجتمع NEXA.'}</p></section></aside></div>`;
-      return `<div class="app-shell"><aside class="sidebar"><div class="brand"><button class="brand-mark" data-logo-trigger aria-label="NEXA">N</button><span>NEXA</span></div><div class="profile-mini">${avatar(user.avatar, user.color)}<div><strong>${guest ? 'زائر NEXA' : `${user.displayName || user.username} ${verificationBadge(user)}`}</strong><small>${guest ? 'شاهد بدون حساب' : `@${user.username}`}</small></div><span class="status-dot"></span></div><nav class="primary-nav"><small class="nav-label">${guest ? 'تصفح كزائر' : 'المساحة الشخصية'}</small>${nav()}<small class="nav-label space">استكشف أكثر</small><button class="nav-item ${state.active === 'explore' ? 'active' : ''}" data-nav="explore"><span class="nav-icon">${icons.search}</span><span>بحث عالمي</span></button><button class="nav-item ${state.active === 'saved' ? 'active' : ''}" data-nav="saved" data-requires-auth><span class="nav-icon">${icons.bookmark}</span><span>المحفوظات</span></button></nav><div class="sidebar-bottom">${guest ? '<button class="guest-login" data-auth-screen="login">تسجيل الدخول <span>←</span></button>' : `<div class="trust"><span>${icons.shield}</span><div><strong>حساب موثوق</strong><small>TrustScore 94%</small></div></div><button class="nav-item" data-add-account><span class="nav-icon">${icons.plus}</span><span>إضافة حساب</span></button><button class="nav-item" data-switch-account><span class="nav-icon">${icons.settings}</span><span>تبديل الحساب</span></button>`}</div></aside><main class="main"><header class="topbar"><div><span class="eyebrow">${eyebrow}</span><h1>${title}</h1></div><div class="top-actions"><button class="icon-btn" data-bell-button aria-label="الإشعارات">${icons.bell}${state.unreadNotifications ? `<i class="notification-count">${Math.min(state.unreadNotifications, 9)}</i>` : ''}</button><button class="create-btn" data-nav="studio"><span>${icons.plus}</span> إنشاء</button>${guest ? '<button class="header-login" data-auth-screen="login">دخول</button>' : `<button class="profile-edit-trigger" data-profile-edit aria-label="تعديل البروفايل">${icons.settings}<span>تعديل البروفايل</span></button><button class="logout-btn" data-logout type="button">تسجيل الخروج</button>${avatar(user.avatar, user.color)}`}</div></header>${content}</main><aside class="right-rail"><section class="rail-card profile-card"><div class="cover"></div><div class="profile-card-body">${avatar(user.avatar, user.color, 'large')}<button class="edit-btn" data-profile-edit>${guest ? 'إنشاء ملفك' : 'تعديل الملف'}</button><h3>${guest ? 'زائر NEXA' : `${user.displayName || user.username} ${verificationBadge(user)}`}</h3><p>${guest ? 'سجّل لتخصيص تجربتك' : `@${user.username}`}</p><div class="profile-stats"><span><b>${user.followers || 0}</b>متابع</span><span><b>0</b>يتابع</span><span><b>${state.userVideos.length}</b>منشور</span></div></div></section><section class="rail-section trends"><div class="section-heading"><h3>ابدأ رحلتك</h3></div><p>${guest ? 'شاهد الفيديوهات الآن، وسجّل للحفظ والتعليق والنشر.' : 'أنشئ أول فيديو وشاركه مع مجتمع NEXA.'}</p></section></aside></div>`;
+  return `<div class="app-shell"><aside class="sidebar"><div class="brand"><button class="brand-mark" data-logo-trigger aria-label="NEXA">N</button><span>NEXA</span></div><div class="profile-mini">${avatar(user.avatar, user.color)}<div><strong>${guest ? 'زائر NEXA' : `${user.displayName || user.username} ${verificationBadge(user)}`}</strong><small>${guest ? 'شاهد بدون حساب' : `@${user.username}`}</small></div><span class="status-dot"></span></div><nav class="primary-nav" aria-label="التنقل الرئيسي"><small class="nav-label">${guest ? 'تصفح كزائر' : 'المساحة الشخصية'}</small>${nav()}<small class="nav-label space">مكتبتك</small><button class="nav-item ${state.active === 'saved' ? 'active' : ''}" data-nav="saved" data-requires-auth><span class="nav-icon">${icons.bookmark}</span><span>المحفوظات</span></button></nav><div class="sidebar-bottom">${guest ? '<button class="guest-login" data-auth-screen="login">تسجيل الدخول <span>←</span></button>' : `<div class="trust"><span>${icons.shield}</span><div><strong>حسابك على NEXA</strong><small>إدارة تجربتك وخصوصيتك</small></div></div><button class="nav-item" data-add-account><span class="nav-icon">${icons.plus}</span><span>إضافة حساب</span></button><button class="nav-item" data-switch-account><span class="nav-icon">⇄</span><span>تبديل الحساب</span></button>`}</div></aside><main class="main"><header class="topbar"><div><span class="eyebrow">${eyebrow}</span><h1>${title}</h1></div><div class="top-actions"><button class="icon-btn" data-nav="settings" aria-label="الإعدادات" title="الإعدادات">${icons.settings}</button><button class="icon-btn" data-bell-button aria-label="الإشعارات">${icons.bell}${state.unreadNotifications ? `<i class="notification-count">${Math.min(state.unreadNotifications, 9)}</i>` : ''}</button><button class="create-btn" data-nav="studio"><span>${icons.plus}</span> إنشاء</button>${guest ? '<button class="header-login" data-auth-screen="login">دخول</button>' : `<button class="profile-edit-trigger" data-profile-edit aria-label="تعديل الملف الشخصي"><span>تعديل الملف</span></button><button class="logout-btn" data-logout type="button">تسجيل الخروج</button>${avatar(user.avatar, user.color)}`}</div></header>${content}</main><aside class="right-rail"><section class="rail-card profile-card"><div class="cover"></div><div class="profile-card-body">${avatar(user.avatar, user.color, 'large')}<button class="edit-btn" data-profile-edit>${guest ? 'إنشاء ملفك' : 'تعديل الملف'}</button><h3>${guest ? 'زائر NEXA' : `${user.displayName || user.username} ${verificationBadge(user)}`}</h3><p>${guest ? 'سجّل لتخصيص تجربتك' : `@${user.username}`}</p><div class="profile-stats"><span><b>${user.followers || 0}</b>متابع</span><span><b>${state.subscribed.size}</b>يتابع</span><span><b>${state.userVideos.length}</b>منشور</span></div></div></section><section class="rail-section trends"><div class="section-heading"><h3>ابدأ رحلتك</h3></div><p>${guest ? 'شاهد الفيديوهات الآن، وسجّل للحفظ والتعليق والنشر.' : 'أنشئ أول فيديو وشاركه مع مجتمع NEXA.'}</p><button class="text-btn" data-nav="studio">ابدأ الإنشاء ←</button></section></aside></div>`;
 }
 
 function feedView() {
@@ -638,7 +662,7 @@ function feedView() {
       : allStreamVideos;
   const people = discoverableUsers();
   const streamContent = streamVideos.length ? streamVideos.map(videoCard).join('') : `<div class="stream-empty"><span>${icons.studio}</span><h2>لا توجد فيديوهات بعد</h2><p>أنشئ فيديوك الأول ليظهر هنا للمستخدمين.</p><button class="primary-btn" data-nav="studio">افتح الاستوديو <span>←</span></button></div>`;
-  return shell(`<div class="feed-layout"><section class="feed-column"><div class="stories-row"><button class="story add-story" data-nav="studio"><span>${icons.plus}</span><small>قصتك</small></button>${['قصتك'].map(x => `<button class="story" data-nav="studio"><span class="story-ring coral">${currentUser().avatar}</span><small>${x}</small></button>`).join('')}</div><div class="feed-tabs"><button class="selected">لك</button><button>يتابعون</button><button>الأحدث</button><span class="feed-filter">⌁</span></div><div class="stream-label"><span class="eyebrow">NEXA STREAM</span><small>${streamVideos.length ? 'اسحب للأعلى للمقطع التالي' : 'ابدأ بالنشر'}</small></div><div class="stream-list">${streamContent}</div></section><aside class="feed-side"><div class="ai-card"><div class="ai-heading"><span class="ai-orb">✦</span><div><small>HyperBrain</small><strong>توصياتك تبدأ منك</strong></div></div><p>ستتغير التوصيات بعد مشاهدة فيديوهات المستخدمين والتفاعل معها.</p><button class="text-btn">إدارة التفضيلات <span>←</span></button></div><div class="suggestions"><div class="section-heading"><h3>أشخاص على NEXA</h3><button>تحديث</button></div>${people.length ? people.map(user => `<div class="suggestion">${avatar(user.avatar, user.color)}<div><strong>${user.username} ${verificationBadge(user)}</strong><small>${user.followers || 0} متابع</small></div><button class="follow-btn ${state.subscribed.has(user.email) ? 'following' : ''}" data-follow-person="${user.email}">${state.subscribed.has(user.email) ? 'تتابعه' : 'متابعة'}</button></div>`).join('') : '<p class="suggestions-empty">لا يوجد أشخاص آخرون بعد.</p>'}</div></aside></div>`, 'مساحتك اليوم', 'الثلاثاء، 22 سبتمبر 2026');
+  return shell(`<div class="feed-layout"><section class="feed-column"><div class="stories-row"><button class="story add-story" data-nav="studio"><span>${icons.plus}</span><small>قصتك</small></button>${['قصتك'].map(x => `<button class="story" data-nav="studio"><span class="story-ring coral">${currentUser().avatar}</span><small>${x}</small></button>`).join('')}</div><div class="feed-tabs"><button data-feed-filter="for-you" class="${state.feedFilter === 'for-you' ? 'selected' : ''}">لك</button><button data-feed-filter="following" class="${state.feedFilter === 'following' ? 'selected' : ''}">يتابعون</button><button data-feed-filter="latest" class="${state.feedFilter === 'latest' ? 'selected' : ''}">الأحدث</button><span class="feed-filter" aria-hidden="true">⌁</span></div><div class="stream-label"><span class="eyebrow">NEXA STREAM</span><small>${streamVideos.length ? 'اسحب للأعلى للمقطع التالي' : 'ابدأ بالنشر'}</small></div><div class="stream-list">${streamContent}</div></section><aside class="feed-side"><div class="ai-card"><div class="ai-heading"><span class="ai-orb">✦</span><div><small>HyperBrain</small><strong>توصياتك تبدأ منك</strong></div></div><p>ستتغير التوصيات بعد مشاهدة فيديوهات المستخدمين والتفاعل معها.</p><button class="text-btn" data-nav="settings">إدارة التفضيلات <span>←</span></button></div><div class="suggestions"><div class="section-heading"><h3>أشخاص على NEXA</h3><button type="button" data-refresh-content>تحديث</button></div>${people.length ? people.map(user => `<div class="suggestion">${avatar(user.avatar, user.color)}<div><strong>${user.username} ${verificationBadge(user)}</strong><small>${user.followers || 0} متابع</small></div><button class="follow-btn ${state.subscribed.has(user.email) ? 'following' : ''}" data-follow-person="${user.email}">${state.subscribed.has(user.email) ? 'تتابعه' : 'متابعة'}</button></div>`).join('') : '<p class="suggestions-empty">لا يوجد أشخاص آخرون بعد.</p>'}</div></aside></div>`, 'مساحتك اليوم', 'مساحتك على NEXA');
 }
 
 function videoCard(video) { const liked = state.liked.has(video.id); const saved = state.saved.has(video.id); const authorIsCurrent = video.authorEmail === currentUser().id || video.authorEmail === currentUser().email; const following = state.subscribed.has(video.authorEmail || video.handle); return `<article class="video-card"><div class="video-visual ${video.color}"><video class="stream-video" data-video="${video.id}" src="${video.src}" muted autoplay loop playsinline preload="auto"></video><div class="visual-grain"></div><div class="video-top"><span class="live-tag">لـك</span><button class="visual-more">${icons.more}</button></div><button class="play-button" data-play="${video.id}" aria-label="تشغيل أو إيقاف الفيديو">${icons.play}</button><div class="video-caption">${avatar(video.avatar, video.color)}<div><strong>${video.author}</strong><small>${video.handle}</small></div>${authorIsCurrent ? '' : `<button class="follow-pill ${following ? 'following' : ''}" data-follow-person="${video.authorEmail || video.handle}">${following ? 'تتابع' : 'متابعة'}</button>`}<p>${video.title}</p><small>${video.tags}</small></div><div class="video-actions"><button class="action ${liked ? 'active' : ''}" data-like="${video.postId || video.id}"><span>${liked ? '♥' : icons.heart}</span><small>${liked ? 'أعجبك' : 'إعجاب'}</small></button><button class="action" data-comment-post="${video.postId || video.id}"><span>${icons.comment}</span><small>تعليق</small></button><button class="action" data-report-post="${video.postId || video.id}"><span>${icons.shield}</span><small>إبلاغ</small></button><button class="action"><span>${icons.share}</span><small>مشاركة</small></button><button class="action ${saved ? 'active' : ''}" data-save="${video.postId || video.id}"><span>${icons.bookmark}</span></button></div></div></article>`; }
@@ -691,6 +715,23 @@ function moderationView() {
   return shell(`<div class="explore-page"><div class="section-heading"><div><span class="eyebrow">إشراف المجتمع</span><h2>مراجعة المحتوى</h2><small>${state.moderationPosts.length} منشور بانتظار المراجعة</small></div><button class="outline-btn" data-refresh-moderation>تحديث</button></div><div class="explore-posts">${items || '<div class="explore-empty">لا يوجد محتوى بانتظار المراجعة.</div>'}</div></div>`, 'مراجعة المحتوى', 'الإشراف');
 }
 function profileEditView() { const user = currentUser(); return shell(`<div class="profile-edit-page"><div class="page-heading"><div><span class="eyebrow">ملفك الشخصي</span><h2>عدّل هويتك</h2><p>غيّر الاسم واليوزر والنبذة في أي وقت.</p></div></div><form class="profile-form" data-profile-edit-form><label>الاسم المعروض<input name="displayName" value="${user.displayName || ''}" required minlength="2" maxlength="30" /></label><label>اسم المستخدم<input name="username" value="${user.username || ''}" pattern="${USERNAME_PATTERN.source}" required minlength="3" maxlength="20" /><small class="field-hint">يبدأ بحرف إنجليزي، ثم أحرف أو أرقام أو _</small></label><label>النبذة<textarea name="bio" maxlength="120" placeholder="اكتب نبذة قصيرة">${user.bio || ''}</textarea></label><button class="auth-submit" type="submit">حفظ التغييرات <span>←</span></button></form></div>`, 'الملف الشخصي', 'حسابك'); }
+
+function settingsView() {
+  const themeOptions = [
+    ['dark', 'ليلي', 'تباين هادئ للمساء'],
+    ['light', 'نهاري', 'واجهة واضحة بإضاءة متوازنة']
+  ];
+  const textOptions = [['compact', 'صغير'], ['normal', 'متوسط'], ['large', 'كبير']];
+  return shell(`<div class="settings-page">
+    <section class="settings-intro"><span class="settings-intro-icon">${icons.settings}</span><div><span class="eyebrow">تجربتك على NEXA</span><h2>مساحة تناسبك</h2><p>عدّل العرض والقراءة والحركة لتناسب جهازك وراحتك.</p></div></section>
+    <div class="settings-grid">
+      <section class="settings-card settings-appearance"><div class="settings-card-heading"><span class="settings-card-icon">◐</span><div><h3>مظهر التطبيق</h3><p>اختر ألوان الواجهة المناسبة لك.</p></div></div><div class="settings-choice-grid" role="group" aria-label="مظهر التطبيق">${themeOptions.map(([value, label, detail]) => `<button type="button" class="settings-choice ${state.uiTheme === value && !state.eyeComfort ? 'selected' : ''}" data-preference="theme" data-value="${value}" aria-pressed="${state.uiTheme === value && !state.eyeComfort}"><span class="theme-preview ${value}"><i></i><i></i><i></i></span><strong>${label}</strong><small>${detail}</small></button>`).join('')}<button type="button" class="settings-choice ${state.eyeComfort ? 'selected' : ''}" data-preference="eye-comfort" data-value="${!state.eyeComfort}" aria-pressed="${state.eyeComfort}"><span class="theme-preview comfort"><i></i><i></i><i></i></span><strong>راحة العين</strong><small>ألوان دافئة وتقليل الوهج</small></button></div><p class="settings-hint">إعدادات العرض تساعد على تحسين الراحة، لكنها لا تغني عن فترات الراحة أو ضبط سطوع الشاشة.</p></section>
+      <section class="settings-card"><div class="settings-card-heading"><span class="settings-card-icon">Aa</span><div><h3>حجم النص</h3><p>كبّر النص لتحسين سهولة القراءة.</p></div></div><div class="settings-segmented" role="group" aria-label="حجم النص">${textOptions.map(([value, label]) => `<button type="button" class="${state.textScale === value ? 'selected' : ''}" data-preference="text-scale" data-value="${value}" aria-pressed="${state.textScale === value}">${label}</button>`).join('')}</div><div class="text-preview"><span>معاينة القراءة</span><strong>كل عالمك، في مساحة واحدة.</strong><small>تتغير أحجام النصوص لتلائم تفضيلك.</small></div></section>
+      <section class="settings-card settings-motion"><div class="settings-card-heading"><span class="settings-card-icon">↝</span><div><h3>الحركة والتركيز</h3><p>بسّط الحركة لتخفيف المشتتات.</p></div></div><button type="button" class="settings-switch-row" data-preference="reduce-motion" data-value="${!state.motionReduced}" role="switch" aria-checked="${state.motionReduced}"><span><strong>تقليل الحركة</strong><small>إيقاف الانتقالات والحركات غير الضرورية.</small></span><i class="switch-track"><b></b></i></button><div class="focus-note"><span>✦</span><p>يمكنك دائمًا استخدام إعدادات السطوع وراحة الشاشة في جهازك للحصول على تجربة أنسب.</p></div></section>
+      <section class="settings-card settings-shortcuts"><div class="settings-card-heading"><span class="settings-card-icon">⌘</span><div><h3>اختصاراتك</h3><p>انتقل مباشرةً إلى أهم أدوات NEXA.</p></div></div><div class="settings-shortcut-list"><button type="button" data-nav="profile"><span>◉</span>ملفي الشخصي<b>←</b></button><button type="button" data-nav="saved" data-requires-auth><span>${icons.bookmark}</span>المحفوظات<b>←</b></button><button type="button" data-nav="messages" data-requires-auth><span>${icons.messages}</span>الرسائل<b>←</b></button></div></section>
+    </div>
+  </div>`, 'الإعدادات', 'التخصيص');
+}
 
 function profileVideoGrid(items, emptyText) {
   if (!items.length) return `<div class="profile-grid-empty"><span>${icons.studio}</span><p>${emptyText}</p><button class="primary-btn" data-nav="studio">افتح الاستوديو <span>←</span></button></div>`;
@@ -758,7 +799,7 @@ function render() {
     bindEvents();
     return;
   }
-  const views = { feed: feedView, explore: exploreView, saved: savedView, messages: messagesView, 'channel-chat': channelChatView, studio: studioView, spaces: spacesView, profile: profileView, 'profile-edit': profileEditView, developers: developerAppView, moderation: moderationView };
+  const views = { feed: feedView, explore: exploreView, saved: savedView, messages: messagesView, channel-chat: channelChatView, studio: studioView, spaces: spacesView, profile: profileView, settings: settingsView, 'profile-edit': profileEditView, developers: developerAppView, moderation: moderationView };
   document.querySelector('#app').innerHTML = views[state.active](); bindEvents();
   } catch (error) {
     console.error('NEXA render failed', error);
@@ -804,14 +845,53 @@ function bindEvents() {
     status.textContent = button.textContent;
     button.replaceWith(status);
   });
-  const feedFilters = ['for-you', 'following', 'latest'];
-  document.querySelectorAll('.feed-tabs button').forEach((button, index) => {
-    button.classList.toggle('selected', feedFilters[index] === state.feedFilter);
+  document.querySelectorAll('[data-feed-filter]').forEach(button => {
+    button.classList.toggle('selected', button.dataset.feedFilter === state.feedFilter);
     button.addEventListener('click', () => {
-      state.feedFilter = feedFilters[index];
+      state.feedFilter = button.dataset.feedFilter;
       render();
     });
   });
+  document.querySelectorAll('[data-preference]').forEach(button => button.addEventListener('click', async () => {
+    const preference = button.dataset.preference;
+    if (preference === 'theme') {
+      state.uiTheme = button.dataset.value;
+      state.eyeComfort = false;
+      writeLocalValue('nexa-theme', state.uiTheme);
+      writeLocalValue('nexa-eye-comfort', 'false');
+    } else if (preference === 'eye-comfort') {
+      state.eyeComfort = button.dataset.value === 'true';
+      if (state.eyeComfort) state.uiTheme = 'light';
+      writeLocalValue('nexa-theme', state.uiTheme);
+      writeLocalValue('nexa-eye-comfort', String(state.eyeComfort));
+    } else if (preference === 'text-scale') {
+      state.textScale = button.dataset.value;
+      writeLocalValue('nexa-text-scale', state.textScale);
+    } else if (preference === 'reduce-motion') {
+      state.motionReduced = button.dataset.value === 'true';
+      writeLocalValue('nexa-reduced-motion', String(state.motionReduced));
+    }
+    applyDisplayPreferences();
+    render();
+    if (isAuthenticated() && (preference === 'theme' || preference === 'eye-comfort')) {
+      try {
+        await api('/api/me/settings', { method: 'PATCH', body: JSON.stringify({ theme: state.uiTheme }) });
+        state.activeUser.theme = state.uiTheme;
+        persistAuth();
+      } catch {
+        toast('تم تطبيق المظهر على هذا الجهاز، وتعذر حفظه في الحساب.');
+      }
+    }
+  }));
+  document.querySelectorAll('[data-refresh-content]').forEach(button => button.addEventListener('click', async () => {
+    button.disabled = true;
+    try {
+      await hydrateBackendContent();
+      toast('تم تحديث المحتوى');
+    } finally {
+      button.disabled = false;
+    }
+  }));
   document.querySelectorAll('[data-remove-offline]').forEach(button => button.addEventListener('click', async () => {
     await removeOfflineAction(button.dataset.removeOffline);
     await refreshOfflineActions();
